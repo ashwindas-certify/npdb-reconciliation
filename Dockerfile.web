@@ -1,0 +1,20 @@
+# Multi-stage: build the React app, then serve it from FastAPI in one image.
+# Build context = npdb_tool/.   Build: docker build -f Dockerfile.web -t npdb-web .
+FROM node:20-slim AS fe
+WORKDIR /fe
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install
+COPY frontend/ ./
+RUN npm run build                 # -> /fe/dist
+
+FROM python:3.12-slim
+WORKDIR /app
+COPY backend/requirements.txt ./backend/requirements.txt
+RUN pip install --no-cache-dir -r backend/requirements.txt
+COPY reconcile_core.py ./reconcile_core.py
+COPY backend/ ./backend/
+COPY --from=fe /fe/dist ./backend/static
+# SA key injected at runtime via env GOOGLE_SA_KEY_JSON (Secret Manager) — never baked in.
+ENV PORT=8080
+EXPOSE 8080
+CMD uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}

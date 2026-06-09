@@ -1,0 +1,10 @@
+# Build the FastAPI+React image with the multi-stage Dockerfile.web.
+#   gcloud builds submit --config cloudbuild.yaml --substitutions=_IMG=gcr.io/$PROJECT_ID/npdb-web .
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "Dockerfile.web", "-t", "${_IMG}", "."]
+images: ["${_IMG}"]
+substitutions:
+  _IMG: "gcr.io/${PROJECT_ID}/npdb-web"
+options:
+  machineType: E2_HIGHCPU_8

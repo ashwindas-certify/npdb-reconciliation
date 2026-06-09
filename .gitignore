@@ -1,0 +1,19 @@
+# --- secrets / credentials (NEVER commit) ---
+*service*account*.json
+create-*.json
+*-key*.json
+*token*.json
+client_secret*.json
+.env
+.env.*
+
+# --- build / deps ---
+node_modules/
+frontend/dist/
+backend/static/
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.DS_Store
