@@ -19,7 +19,8 @@ def main():
     a = ap.parse_args()
     res = reconcile(sheet_id(a.sheet), a.sot, a.npdb, Config(accept_score=a.accept),
                     write=not a.no_write, progress=lambda m: print(m))
-    print(f"\nTotal {res.total:,} | action {res.action_count:,} | balanced {res.balanced}")
+    print(f"\nTotal {res.total:,} | action {res.action_count:,} | "
+          f"extra NPDB enrollments not in SOT {res.extra_enrollments:,} | balanced {res.balanced}")
     print("Confidence:", res.confidence)
     print("Wrote tabs:", ", ".join(res.written_tabs) or "(none)")
 

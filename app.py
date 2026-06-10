@@ -85,6 +85,7 @@ if run:
             st.error(f"Run failed: {str(e)[:300]}"); st.stop()
     status.empty()
     st.success(f"Done ✓ — {res.total:,} providers · {res.action_count:,} need action · "
+               f"{res.extra_enrollments:,} extra NPDB enrollments not in SOT · "
                f"Balanced: {'YES ✅' if res.balanced else 'NO ⚠️'}")
     st.markdown(f"**Results written to:** {', '.join('`'+t+'`' for t in res.written_tabs)}")
     st.link_button("Open Google Sheet ↗", f"https://docs.google.com/spreadsheets/d/{sid}")

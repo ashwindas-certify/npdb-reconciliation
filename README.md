@@ -17,8 +17,21 @@ Web UI (Streamlit) + reusable core + CLI.
    `sheet-access@create-494211.iam.gserviceaccount.com`
 2. Open the tool → paste the **Sheet URL** → pick the **SOT** and **NPDB** tabs.
 3. (Optional) tweak status mappings / match score under *Advanced*.
-4. Click **Run** → results are written as tabs (`README`, `Summary`, `Action_Items_All`,
-   `Missing_Enrollment`, `Should_Be_Cancelled`, `Duplicates`, `Databank_Updates`, `Reconciliation`).
+4. Click **Run** → results are written as tabs (`readme`, `summary`, `action_items_all`,
+   `missing_enrollment`, `should_be_cancelled`, `duplicates`, `databank_updates`,
+   `extra_enrollments`, `reconciliation`).
+
+### Identity matching & extra enrollments
+- **Matching** scores each provider against NPDB on **NPI, SSN-last4, DOB, license # (+ issuing
+  state), first/middle/last name** — never NPI alone. The license # and state are parsed out of
+  the NPDB compound `License` field (e.g. `Physician (MD) - 7324191-6004 - UT`). SOT license #/
+  state columns are auto-detected from the header (override via `Config.sot_license_col` /
+  `sot_license_state_col`). Confidence is HIGH only with corroboration (e.g. NPI + name/DOB/license,
+  or license # + state + name).
+- **`extra_enrollments`** is a reverse pass: every NPDB enrollment that matches *no* provider in the
+  SOT, grouped by person. Each is reverse-matched back to the SOT; `LINK_TO_PROVIDER` (with a
+  `suggested_providerId`) when a provider is found at ≥ `link_confidence`, else `ADD_TO_SOT` with a
+  ready-to-append SOT row in the `append_*` columns.
 
 ## Run locally
 ```bash
