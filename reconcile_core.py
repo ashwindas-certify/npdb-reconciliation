@@ -108,6 +108,8 @@ class Config:
                                                # true -> direct provider (expect enrollment), false -> delegated (no enrollment)
     npdb_gender_field: str | None     = None   # gender/sex field in the NPDB report (auto-detected; usually 'Sex')
     max_rows_per_tab: int    = 100000      # split a result tab into <name>_2, _3… past this many rows (0 = never)
+    cell_budget: int         = 9_000_000   # stay under Sheets' 10M-cells-per-spreadsheet cap; biggest
+                                           # tabs are trimmed (with a readme note) rather than erroring
     sa_key_path: str | None  = None        # falls back to env
     # --- BigQuery SOT source (auth = your local ADC; no service account) ---
     bq_project: str | None     = None      # GCP project to bill/run the query in
@@ -137,12 +139,15 @@ def get_service(sa_key_path: str | None = None):
         path = sa_key_path or os.environ.get("GOOGLE_SA_KEY") or \
                os.path.join(os.path.expanduser("~"), "Downloads", "create-494211-147f2005e4ac.json")
         creds = service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    # large reads/writes (100K-row tabs) outlive the default 60s socket timeout
+    import google_auth_httplib2, httplib2
+    authed = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
+    return build("sheets", "v4", http=authed, cache_discovery=False)
 
 # --------------------------- BigQuery (SOT source) ---------------------------
 # Auth is YOUR local Application Default Credentials — NO service account needed.
 # One-time:  gcloud auth application-default login
-def bq_rows(sql: str, params: dict | None = None, project: str | None = None):
+def bq_rows(sql: str, params: dict | None = None, project: str | None = None, progress=None):
     """Run a parameterized query and return rows as list[dict] — same shape as read_tab(),
     so the rest of reconcile() is source-agnostic. `params` -> @name STRING params,
     e.g. bq_rows(SOT_SQL, {'client': 'Headway'}). Values come back native (dates/bools);
@@ -154,8 +159,12 @@ def bq_rows(sql: str, params: dict | None = None, project: str | None = None):
         job_cfg = bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()])
     # NULL -> "" so BigQuery rows behave like (empty) sheet cells for the normalizers
-    return [{k: ("" if v is None else v) for k, v in r.items()}
-            for r in client.query(sql, job_config=job_cfg).result()]
+    out = []
+    for r in client.query(sql, job_config=job_cfg).result(page_size=50000):
+        out.append({k: ("" if v is None else v) for k, v in r.items()})
+        if progress and len(out) % 50000 == 0:
+            progress(f"fetched {len(out):,} rows from BigQuery…")
+    return out
 
 def bq_clients(cfg: "Config"):
     """Distinct client/organization names for the dropdown (first column of the clients query)."""
@@ -163,10 +172,10 @@ def bq_clients(cfg: "Config"):
     return [str(list(r.values())[0]) for r in bq_rows(sql, project=cfg.bq_project or DEFAULT_BQ_PROJECT)
             if list(r.values())[0] not in (None, "")]
 
-def bq_sot(client: str, cfg: "Config"):
+def bq_sot(client: str, cfg: "Config", progress=None):
     """SOT rows for one client (organization name) from BigQuery — SOT_SQL with @client."""
     sql = cfg.bq_sot_sql or SOT_SQL
-    return bq_rows(sql, {"client": client}, project=cfg.bq_project or DEFAULT_BQ_PROJECT)
+    return bq_rows(sql, {"client": client}, project=cfg.bq_project or DEFAULT_BQ_PROJECT, progress=progress)
 
 def _retry(fn, what=""):
     for a in range(5):
@@ -178,6 +187,33 @@ def _retry(fn, what=""):
 def list_tabs(svc, sheet_id):
     meta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id).execute(), "meta")
     return [s["properties"]["title"] for s in meta["sheets"]]
+
+# canonical sheet-style NPDB headers the parser expects
+_NPDB_CANON = ["Data Bank Subject ID Number","NPI","SSN","Birthdate","First Name","Last Name",
+               "Middle Name","License","NPDB Enrollment Status","Submitted on Behalf of Entity",
+               "Enrollment Start Date","Cancellation Date","Cancelled By","Sex"]
+_NPDB_ALIAS = {"databanksubjectid": "Data Bank Subject ID Number",
+               "databankid": "Data Bank Subject ID Number",
+               "subjectid": "Data Bank Subject ID Number",
+               "dateofbirth": "Birthdate", "dob": "Birthdate",
+               "enrollmentstatus": "NPDB Enrollment Status",
+               "entity": "Submitted on Behalf of Entity",
+               "canceldate": "Cancellation Date",
+               "canceledby": "Cancelled By",
+               "cancellationby": "Cancelled By",
+               "cancellationuser": "Cancelled By",
+               "gender": "Sex"}
+
+def normalize_npdb_keys(rows):
+    """Map BigQuery-style NPDB column names (first_name, npdb_enrollment_status, …) to the
+    sheet-style headers the parser expects ('First Name', 'NPDB Enrollment Status', …).
+    Sheet tabs already carry the canonical headers, so this is applied only to BQ rows."""
+    if not rows: return rows
+    canon = {re.sub(r"[^a-z0-9]", "", c.lower()): c for c in _NPDB_CANON}
+    canon.update(_NPDB_ALIAS)
+    keymap = {k: canon.get(re.sub(r"[^a-z0-9]", "", str(k).lower()), k) for k in rows[0]}
+    if all(k == v for k, v in keymap.items()): return rows
+    return [{keymap[k]: v for k, v in r.items()} for r in rows]
 
 def read_tab(svc, sheet_id, tab):
     vals = _retry(lambda: svc.spreadsheets().values().get(
@@ -258,14 +294,18 @@ def _detect_col(keys, exacts, contains_all=(), contains_any=(), avoid=()):
     return None
 
 # ----------------------------- core -------------------------------
-def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | None = None,
-              write: bool = True, progress=lambda m: None, sot_rows: list | None = None) -> Result:
-    """`sheet_id` holds the NPDB report tab (`npdb_tab`) and receives the result tabs.
-    SOT comes from either a tab in that sheet (`sot_tab`) OR pre-fetched rows passed as
-    `sot_rows` (e.g. from BigQuery via bq_sot(client, cfg)) — exactly one of the two."""
+def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Config | None = None,
+              write: bool = True, progress=lambda m: None, sot_rows: list | None = None,
+              npdb_rows: list | None = None) -> Result:
+    """`sheet_id` receives the result tabs. SOT comes from either a tab in that sheet
+    (`sot_tab`) OR pre-fetched rows passed as `sot_rows` (e.g. from BigQuery via
+    bq_sot(client, cfg)) — exactly one of the two. Likewise the NPDB report comes from
+    either `npdb_tab` (a tab of the sheet) OR pre-fetched `npdb_rows` (e.g. from BigQuery)."""
     cfg = cfg or Config()
     if sot_rows is None and not sot_tab:
         raise ValueError("provide sot_tab (read from sheet) or sot_rows (e.g. from BigQuery)")
+    if npdb_rows is None and not npdb_tab:
+        raise ValueError("provide npdb_tab (read from sheet) or npdb_rows (e.g. from BigQuery)")
     svc = get_service(cfg.sa_key_path)
 
     def status_class(s):
@@ -283,13 +323,20 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
         progress(f"Using {len(sot_rows):,} SOT rows from BigQuery…"); sot_raw = sot_rows
     else:
         progress("Reading SOT…"); sot_raw = read_tab(svc, sheet_id, sot_tab)
-    progress("Reading NPDB…"); npdb_raw = read_tab(svc, sheet_id, npdb_tab)
+    if npdb_rows is not None:
+        progress(f"Using {len(npdb_rows):,} NPDB rows from BigQuery…"); npdb_raw = normalize_npdb_keys(npdb_rows)
+    else:
+        progress("Reading NPDB…"); npdb_raw = read_tab(svc, sheet_id, npdb_tab)
     progress(f"SOT {len(sot_raw):,} rows · NPDB {len(npdb_raw):,} rows — matching…")
 
     npdb = []
     npdb_keys = list(npdb_raw[0].keys()) if npdb_raw else []
     npdb_gender_key = cfg.npdb_gender_field or _detect_col(
         npdb_keys, exacts=("sex","gender","subject sex","subject gender"), contains_any=("gender","sex"))
+    # who cancelled the enrollment (only some NPDB reports carry it)
+    npdb_cancelby_key = _detect_col(
+        npdb_keys, exacts=("cancelled by","canceled by","cancelled_by","canceled_by","cancellation by"),
+        contains_all=("cancel",), contains_any=("by","user","who"), avoid=("date",))
     by_npi, by_ssn4, by_dob_last, by_dob, by_licnum = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list), defaultdict(list))
     for r in npdb_raw:
@@ -305,6 +352,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
                "entity": str(r.get("Submitted on Behalf of Entity","")).strip(),
                "enroll_start": str(r.get("Enrollment Start Date","")).strip(),
                "cancel_date": str(r.get("Cancellation Date","")).strip(),
+               "cancelled_by": str(r.get(npdb_cancelby_key,"")).strip() if npdb_cancelby_key else "",
                "raw_first": str(r.get("First Name","")).strip(), "raw_last": str(r.get("Last Name","")).strip(),
                "raw_middle": str(r.get("Middle Name","")).strip()}
         i = len(npdb); npdb.append(rec)
@@ -445,12 +493,14 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
     matched_any = set()        # NPDB row indices claimed by some SOT provider (for the reverse pass)
     ACTIONABLE = {"MISSING_ENROLLMENT","DUPLICATE_ENROLLMENT","SHOULD_BE_CANCELLED","DATABANK_ID_OUT_OF_SYNC"}
     # NPDB data points each row was compared against (matched record)
-    NPDB_HDR  = ["npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_databank_id","npdb_enroll_status","npdb_entity"]
+    NPDB_HDR  = ["npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_databank_id","npdb_enroll_status",
+                 "npdb_entity","npdb_enroll_start","npdb_cancel_date","npdb_cancelled_by"]
     NPDB3_HDR = ["npdb_name","npdb_npi","npdb_dob"]
     def npdb_pts(m):
-        if not m: return ["", "", "", "", "", "", ""]
+        if not m: return [""] * len(NPDB_HDR)
         return [f"{m['raw_last']}, {m['raw_first']}".strip(", "), m["npi"], m["dob"], m["ssn4"],
-                m["databank_id"], m["enroll_status"], m["entity"]]
+                m["databank_id"], m["enroll_status"], m["entity"],
+                m["enroll_start"], m["cancel_date"], m["cancelled_by"]]
     def npdb3(m):
         return [f"{m['raw_last']}, {m['raw_first']}".strip(", "), m["npi"], m["dob"]] if m else ["","",""]
     def _start_ts(m):
@@ -525,12 +575,13 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
             for j, m in enumerate(active_ms):   # oldest first -> retain it (max history)
                 retain = "KEEP (oldest / max history)" if j == 0 else "cancel"
                 dups.append([pid, pname, npi, cs, retain, m["databank_id"], m["enroll_status"],
-                             m["entity"], m["enroll_start"], m["cancel_date"], *npdb3(m)])
+                             m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"], *npdb3(m)])
         if "DATABANK_ID_OUT_OF_SYNC" in flags:
             db_updates.append([pid, pname, npi, cs, ("missing" if not sot_db else "mismatch"),
                                sot_db, suggested_db, statuses,
                                next((m["entity"] for m in matched if m["databank_id"] == suggested_db), ""),
-                               *npdb3(prim)])
+                               (prim["enroll_start"] if prim else ""), (prim["cancel_date"] if prim else ""),
+                               (prim["cancelled_by"] if prim else ""), *npdb3(prim)])
         if "MISSING_ENROLLMENT" in flags:
             missing_rows.append([pid, pname, npi, cs,
                                  ("NO_NPDB_RECORD" if not matched else "ENROLLMENT_NOT_ACTIVE"),
@@ -539,7 +590,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
             for m in matched:
                 if m["enroll_class"] == "active":
                     cancel_rows.append([pid, pname, npi, cs, m["databank_id"], m["enroll_status"],
-                                        m["entity"], m["enroll_start"], m["cancel_date"], *npdb3(m)])
+                                        m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"], *npdb3(m)])
         acts = [f for f in flags if f in ACTIONABLE]
         if acts:
             action_all.append([pid, pname, npi, cs, cyc_raw, expect, " | ".join(acts), n_enr, n_can,
@@ -593,16 +644,18 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
         states   = sorted({x["state"] for x in ms if x["state"]})
         statuses = "; ".join(sorted({x["enroll_status"] for x in ms if x["enroll_status"]}))
         starts   = "; ".join(sorted({x["enroll_start"] for x in ms if x["enroll_start"]}))
+        cancels  = "; ".join(sorted({x["cancel_date"] for x in ms if x["cancel_date"]}))
+        cancelby = "; ".join(sorted({x["cancelled_by"] for x in ms if x["cancelled_by"]}))
         name     = f"{rep['raw_last']}, {rep['raw_first']}".strip(", ")
         extra_rows.append([
             disp, (pid if link else ""), (rconf if pid else "NONE"), (rbasis if pid else ""), rscore,
             ", ".join(db_ids), name, rep["npi"], rep["dob"], rep["ssn4"],
-            " | ".join(licenses), ", ".join(states), rep["entity"], statuses, starts, len(ms),
+            " | ".join(licenses), ", ".join(states), rep["entity"], statuses, starts, cancels, cancelby, len(ms),
             # ready-to-append SOT row (providerId blank — to create/link):
             "", rep["raw_first"], rep["raw_last"], rep["raw_middle"], rep["npi"], rep["dob"],
             rep["ssn4"], " | ".join(licenses), ", ".join(states)])
     # LINK rows first (actionable now), then ADD rows; within each, most enrollments first
-    extra_rows.sort(key=lambda r: (r[0] != "LINK_TO_PROVIDER", -r[15]))
+    extra_rows.sort(key=lambda r: (r[0] != "LINK_TO_PROVIDER", -r[17]))
 
     # ---- accounting summary ----
     miss_no_rec   = sum(1 for r in missing_rows if r[4] == "NO_NPDB_RECORD")
@@ -696,14 +749,15 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
         "missing_enrollment": ["providerId","provider_name","npi","credentialingStatus","missing_type",
             "npdb_statuses","sot_databank_id","npdb_databank_ids","match_tier","match_score"] + NPDB_HDR,
         "should_be_cancelled": ["providerId","provider_name","npi","credentialingStatus","npdb_databank_id",
-            "npdb_enroll_status","entity","enroll_start_date","cancel_date"] + NPDB3_HDR,
+            "npdb_enroll_status","entity","enroll_start_date","cancel_date","cancelled_by"] + NPDB3_HDR,
         "duplicates": ["providerId","provider_name","npi","credentialingStatus","retain","npdb_databank_id",
-            "npdb_enroll_status","entity","enroll_start_date","cancel_date"] + NPDB3_HDR,
+            "npdb_enroll_status","entity","enroll_start_date","cancel_date","cancelled_by"] + NPDB3_HDR,
         "databank_updates": ["providerId","provider_name","npi","credentialingStatus","update_type",
-            "current_sot_databank_id","suggested_databank_id","npdb_statuses","entity"] + NPDB3_HDR,
+            "current_sot_databank_id","suggested_databank_id","npdb_statuses","entity",
+            "enroll_start_date","cancel_date","cancelled_by"] + NPDB3_HDR,
         "extra_enrollments": ["disposition","suggested_providerId","match_confidence","match_basis","match_score",
             "npdb_databank_ids","npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_licenses","npdb_states",
-            "npdb_entity","npdb_enroll_statuses","enroll_start_dates","npdb_record_count",
+            "npdb_entity","npdb_enroll_statuses","enroll_start_dates","cancellation_dates","cancelled_by","npdb_record_count",
             "append_providerId","append_firstName","append_lastName","append_middleName","append_npi",
             "append_dateOfBirth","append_ssn_last4","append_license","append_license_state"],
     }
@@ -728,38 +782,81 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str, cfg: Config | N
             _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
                 body={"requests": del_reqs}).execute(), "remove old tabs")
             existing -= old_titlecase
-        data["readme"] = _readme(cfg, sot_tab, npdb_tab, bool(sot_rows is not None))
+        data["readme"] = _readme(cfg, sot_tab, npdb_tab, sot_rows is not None, npdb_rows is not None)
+
+        # ---- stay under Google Sheets' 10M-cells-per-spreadsheet cap ----
+        # Cells used by tabs we do NOT rewrite (e.g. the NPDB tab) are fixed; result tabs are
+        # exact-sized below, so their footprint = data size. If the projected total exceeds the
+        # budget, trim the biggest tabs (audit detail) rather than failing mid-write.
+        ncols = {n: (len(headers[n]) if headers.get(n) else max((len(r) for r in data[n]), default=1))
+                 for n in order}
+        split_re = re.compile("(?:%s)_\\d+$" % "|".join(map(re.escape, order)))
+        result_titles = set(order) | {t for t in existing if split_re.fullmatch(t)}
+        fixed_cells = sum((s["properties"].get("gridProperties", {}).get("rowCount", 0) *
+                           s["properties"].get("gridProperties", {}).get("columnCount", 0))
+                          for s in meta["sheets"] if s["properties"]["title"] not in result_titles)
+        over = sum((len(data[n]) + 1) * ncols[n] for n in order) - max(cfg.cell_budget - fixed_cells, 0)
+        if over > 0:
+            for n in ("extra_enrollments", "reconciliation", "action_items_all", "missing_enrollment",
+                      "should_be_cancelled", "duplicates", "databank_updates"):
+                if over <= 0: break
+                cut = min(len(data[n]), -(-over // ncols[n]))
+                if cut <= 0: continue
+                keep = len(data[n]) - cut
+                note = (f"{n}: kept {keep:,} of {len(data[n]):,} rows — Google Sheets' 10,000,000-cell "
+                        f"spreadsheet limit; narrow the query (or use an empty results sheet) to see everything")
+                progress("⚠ " + note)
+                data["readme"] += [[""], ["⚠ " + note]]
+                data[n] = data[n][:keep]
+                over -= cut * ncols[n]
+
+        # plan every tab up front (split into <name>, <name>_2, _3 … past the row cap, header
+        # repeats on each) so stale tabs from a previous, larger run are freed BEFORE writing
         cap = cfg.max_rows_per_tab
-        del_split = []
+        plan = []                                   # (title, header, rows)
         for name in order:
             hdr = headers.get(name); rows = data[name]
-            # split into <name>, <name>_2, _3 … when over the row cap (header repeats on each)
             if cap and len(rows) > cap:
                 chunks = [((name if i == 0 else f"{name}_{i//cap+1}"), rows[i:i+cap])
                           for i in range(0, len(rows), cap)]
                 progress(f"{name}: {len(rows):,} rows → {len(chunks)} tabs")
             else:
                 chunks = [(name, rows)]
-            titles = {t for t, _ in chunks}
-            for title, chunk in chunks:
-                if title not in existing:
-                    resp = _retry(lambda t=title: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                        body={"requests":[{"addSheet":{"properties":{"title":t}}}]}).execute(), f"add {title}")
-                    sheet_ids[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-                    existing.add(title)
-                _retry(lambda t=title: svc.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"'{t}'").execute(), f"clear {title}")
-                body = ([hdr] + chunk) if hdr else chunk
-                _retry(lambda t=title, b=body: svc.spreadsheets().values().update(spreadsheetId=sheet_id,
-                    range=f"'{t}'!A1", valueInputOption="RAW", body={"values": b}).execute(), f"write {title}")
-                written.append(title)
-            # stale split tabs from a previous, larger run (<name>_N no longer produced)
-            del_split += [t for t in list(existing)
-                          if t not in titles and re.fullmatch(re.escape(name) + r"_\d+", t)]
+            plan += [(t, hdr, c) for t, c in chunks]
+        planned = {t for t, _, _ in plan}
+        del_split = [t for t in existing if split_re.fullmatch(t) and t not in planned]
         if del_split:
             _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests":
-                [{"deleteSheet": {"sheetId": sheet_ids[t]}} for t in del_split if t in sheet_ids]}).execute(),
+                [{"deleteSheet": {"sheetId": sheet_ids[t]}} for t in del_split]}).execute(),
                 "remove stale split tabs")
             existing -= set(del_split)
+
+        for title, hdr, chunk in plan:
+            body = ([hdr] + chunk) if hdr else chunk
+            width = max((len(r) for r in body), default=1)
+            if title not in existing:
+                resp = _retry(lambda t=title: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
+                    body={"requests":[{"addSheet":{"properties":{"title":t}}}]}).execute(), f"add {title}")
+                sheet_ids[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+                existing.add(title)
+            # exact-size the grid: reclaims cells left by bigger past runs and guarantees
+            # the chunked writes below always land inside the grid
+            _retry(lambda t=title, r=max(len(body), 2), c=max(width, 1):
+                svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [
+                    {"updateSheetProperties": {"properties": {"sheetId": sheet_ids[t],
+                        "gridProperties": {"rowCount": r, "columnCount": c}},
+                     "fields": "gridProperties(rowCount,columnCount)"}}]}).execute(), f"size {title}")
+            _retry(lambda t=title: svc.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"'{t}'").execute(), f"clear {title}")
+            # write in row batches — one giant update times out on big tabs
+            WRITE_CHUNK = 20000
+            for start in range(0, len(body), WRITE_CHUNK):
+                _retry(lambda t=title, p=body[start:start+WRITE_CHUNK], s=start:
+                    svc.spreadsheets().values().update(spreadsheetId=sheet_id,
+                        range=f"'{t}'!A{s+1}", valueInputOption="RAW",
+                        body={"values": p}).execute(), f"write {title}")
+                if len(body) > WRITE_CHUNK:
+                    progress(f"{title}: wrote {min(start+WRITE_CHUNK, len(body)):,}/{len(body):,} rows…")
+            written.append(title)
 
         # color-code & band the summary tab (values are already written above)
         if "summary" in sheet_ids:
@@ -857,9 +954,11 @@ def _summary_format_reqs(sid, spec):
         "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}})
     return reqs
 
-def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False):
+def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False):
     sot_src = "pulled from BigQuery for the selected client" if sot_from_bq \
               else f"read from the '{sot_tab}' tab"
+    npdb_src = "pulled from BigQuery via a custom query" if npdb_from_bq \
+               else f"the '{npdb_tab}' tab of this sheet"
     return [[x] for x in [
         "NPDB ENROLLMENT RECONCILIATION",
         "",
@@ -870,7 +969,7 @@ def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False):
         "",
         "INPUTS",
         f"  • SOT (our records) — {sot_src}: one row per provider.",
-        f"  • NPDB report — the '{npdb_tab}' tab of this sheet: one row per NPDB enrollment.",
+        f"  • NPDB report — {npdb_src}: one row per NPDB enrollment.",
         "  Each provider is matched to their NPDB record on multiple identity fields (see Methodology).",
         "",
         "RESULT TABS",

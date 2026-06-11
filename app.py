@@ -1,14 +1,16 @@
 """NPDB Enrollment Reconciliation — Streamlit front end.
 
 Run locally:   streamlit run app.py
-The user shares their Google Sheet with the service account, pastes the sheet URL,
-picks the SOT + NPDB tabs, and clicks Run. Results are written back as tabs and the
-accounting summary is shown.
+The user shares their Google Sheet with the service account, then either pastes the
+sheet URL and picks the NPDB tab, OR pastes a BigQuery query that returns the NPDB
+report (plus a results sheet). Results are written back as tabs and the accounting
+summary is shown.
 """
 import re
 import pandas as pd
 import streamlit as st
-from reconcile_core import Config, get_service, list_tabs, reconcile, bq_sot, bq_clients, SA_EMAIL
+from reconcile_core import (Config, get_service, list_tabs, reconcile, bq_sot, bq_rows,
+                            bq_clients, SA_EMAIL, DEFAULT_BQ_PROJECT)
 
 st.set_page_config(page_title="NPDB Reconciliation", page_icon="🩺", layout="centered")
 st.title("🩺 NPDB Enrollment Reconciliation")
@@ -21,11 +23,27 @@ def sheet_id_from(url: str) -> str:
 # 1) share-with-SA banner
 st.info(f"**Step 1 — share your Google Sheet (Editor) with:**\n\n`{SA_EMAIL}`")
 
-# 2) sheet + tabs
-url = st.text_input("Step 2 — Google Sheet URL or ID")
-sid = sheet_id_from(url)
+# 2) NPDB report source — a sheet tab OR a custom BigQuery query
+mode = st.radio("Step 2 — NPDB report source", ["Google Sheet tab", "BigQuery query"], horizontal=True)
 sot_tab = npdb_tab = None
+npdb_sql = ""
 tabs = []
+
+if mode == "Google Sheet tab":
+    url = st.text_input("Google Sheet URL or ID (holds the NPDB tab; results are written here)")
+else:
+    npdb_sql = st.text_area(
+        "BigQuery SQL — NPDB report (one row per enrollment)", height=160,
+        placeholder=("SELECT first_name, last_name, npi, ssn, birthdate, license,\n"
+                     "       npdb_enrollment_status, data_bank_subject_id_number, …\n"
+                     "FROM `project.dataset.npdb_report`"))
+    st.caption("Single SELECT returning the NPDB report columns (First Name, Last Name, NPI, SSN, "
+               "Birthdate, License, NPDB Enrollment Status, Data Bank Subject ID Number, …). "
+               "BigQuery-style names (`first_name`, `npdb_enrollment_status`…) are mapped automatically. "
+               "Use `@client` to filter by the selected client.")
+    url = st.text_input("Results sheet — Google Sheet URL or ID (result tabs are written here)")
+
+sid = sheet_id_from(url)
 if sid:
     try:
         svc = get_service()
@@ -39,8 +57,9 @@ if sid:
             st.error("Sheet not found — check the URL/ID.")
         else:
             st.error(f"Couldn't open the sheet: {msg[:200]}")
+        tabs = []
 
-if tabs:
+if mode == "Google Sheet tab" and tabs:
     def _guess(names, want):
         for n in names:
             if want in n.lower(): return names.index(n)
@@ -77,6 +96,13 @@ with st.expander("Advanced — status mappings & matching (optional)"):
                                     ", ".join(sorted(cfg_default.npdb_cancelled)))
     accept = st.slider("Match accept score", 30, 80, int(cfg_default.accept_score),
                        help="Lower = more matches (looser); higher = stricter.")
+    sot_sql_txt = st.text_area(
+        "Custom SOT query (BigQuery SQL) — optional, overrides the built-in SOT query", "", height=140,
+        placeholder=("SELECT providerId, firstName, lastName, npi, dateOfBirth, credentialingStatus, …\n"
+                     "FROM `project.dataset.table`\nWHERE organization = @client"),
+        help="Must be a single SELECT returning at least a providerId column (plus firstName, lastName, "
+             "npi, dateOfBirth, credentialingStatus…). Use @client to filter by the selected client; "
+             "without it the client pick isn't needed.")
 
 def build_cfg():
     return Config(
@@ -89,15 +115,43 @@ def build_cfg():
 
 # 4) run
 st.divider()
-run = st.button("▶  Run Reconciliation", type="primary", disabled=not (sid and npdb_tab and client))
+_clean = lambda s: (s or "").strip().rstrip(";").strip()
+sot_sql, npdb_q = _clean(sot_sql_txt), _clean(npdb_sql)
+# a client is needed unless every BigQuery source is a custom query that doesn't use @client
+needs_client = (not sot_sql) or ("@client" in sot_sql) or ("@client" in npdb_q)
+ready = bool(sid) and bool(npdb_tab if mode == "Google Sheet tab" else npdb_q) \
+        and (bool(client) or not needs_client)
+run = st.button("▶  Run Reconciliation", type="primary", disabled=not ready)
 if run:
+    for label, q in (("SOT", sot_sql), ("NPDB", npdb_q)):
+        if q and not re.match(r"(?is)^(with|select)\b", q):
+            st.error(f"The {label} query must be a single SELECT (or WITH … SELECT) statement.")
+            st.stop()
     status = st.empty()
     with st.spinner("Running…"):
         try:
             cfg = build_cfg()
-            status.write(f"⏳ Querying BigQuery for {client}…")
-            sot_rows = bq_sot(client, cfg)
-            res = reconcile(sid, None, npdb_tab, cfg, write=True, sot_rows=sot_rows,
+            _tick = lambda m: status.write(f"⏳ {m}")
+            if sot_sql:
+                status.write("⏳ Querying BigQuery — custom SOT query…")
+                sot_rows = bq_rows(sot_sql, {"client": client} if "@client" in sot_sql else None,
+                                   project=DEFAULT_BQ_PROJECT, progress=_tick)
+                if not sot_rows:
+                    raise ValueError("The custom SOT query returned no rows.")
+                if "providerId" not in sot_rows[0]:
+                    raise ValueError("The custom SOT query must return a providerId column "
+                                     "(plus firstName, lastName, npi, dateOfBirth, credentialingStatus, …).")
+            else:
+                status.write(f"⏳ Querying BigQuery for {client}…")
+                sot_rows = bq_sot(client, cfg, progress=_tick)
+            npdb_rows = None
+            if npdb_q:
+                status.write("⏳ Querying BigQuery — NPDB report…")
+                npdb_rows = bq_rows(npdb_q, {"client": client} if "@client" in npdb_q else None,
+                                    project=DEFAULT_BQ_PROJECT, progress=_tick)
+                if not npdb_rows:
+                    raise ValueError("The NPDB query returned no rows.")
+            res = reconcile(sid, None, npdb_tab, cfg, write=True, sot_rows=sot_rows, npdb_rows=npdb_rows,
                             progress=lambda m: status.write(f"⏳ {m}"))
         except Exception as e:
             msg = str(e)

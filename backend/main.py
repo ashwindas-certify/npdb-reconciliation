@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
-from reconcile_core import Config, get_service, list_tabs, reconcile, bq_sot, bq_clients, SA_EMAIL
+from reconcile_core import Config, get_service, list_tabs, reconcile, bq_sot, bq_rows, bq_clients, SA_EMAIL, DEFAULT_BQ_PROJECT
 
 app = FastAPI(title="NPDB Reconciliation")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -29,6 +29,8 @@ def _friendly(e: Exception) -> str:
     ml = m.lower()
     if "default credentials" in ml or "could not automatically determine" in ml or "reauth" in ml:
         return "Not logged in to BigQuery. In a terminal run:  gcloud auth application-default login"
+    if "above the limit" in ml or "10000000" in m:
+        return "The results sheet hit Google Sheets' 10,000,000-cell limit. Use a fresh/empty results sheet, or narrow the query."
     if "403" in m or "permission" in ml or "not have" in ml:
         return "Permission denied. For the sheet: share it (Editor) with the SA. For BigQuery: confirm your account can read the dataset."
     if "404" in m or "not found" in ml:
@@ -58,9 +60,12 @@ def tabs(sheet: str):
         raise HTTPException(status_code=400, detail=_friendly(e))
 
 class RunReq(BaseModel):
-    sheet: str                       # the NPDB sheet (holds npdb_tab; receives result tabs)
-    npdb_tab: str
+    sheet: str                       # results sheet (in sheet mode it also holds npdb_tab)
+    npdb_tab: Optional[str] = None   # NPDB report = a tab of `sheet`…
+    npdb_sql: Optional[str] = None   # …OR a BigQuery query returning the NPDB report
     client: Optional[str] = None     # organization name -> SOT pulled from BigQuery
+    bq_sql: Optional[str] = None     # optional custom SOT query (overrides the built-in one);
+                                     # may reference @client (then a client pick is required)
     sot_tab: Optional[str] = None    # legacy: read SOT from a tab instead of BigQuery
     active: Optional[List[str]] = None
     terminated: Optional[List[str]] = None
@@ -76,11 +81,37 @@ def run(req: RunReq):
     if req.npdb_active:    cfg.npdb_active = {s.strip().lower() for s in req.npdb_active if s.strip()}
     if req.npdb_cancelled: cfg.npdb_cancelled = {s.strip().lower() for s in req.npdb_cancelled if s.strip()}
     if req.accept_score:   cfg.accept_score = float(req.accept_score)
-    if not req.client and not req.sot_tab:
-        raise HTTPException(status_code=400, detail="Pick a client (BigQuery SOT) or a SOT tab.")
+    clean = lambda s: (s or "").strip().rstrip(";").strip()
+    sql, npdb_sql = clean(req.bq_sql), clean(req.npdb_sql)
+    if not req.npdb_tab and not npdb_sql:
+        raise HTTPException(status_code=400, detail="Pick an NPDB tab or provide an NPDB BigQuery query.")
+    if not req.client and not req.sot_tab and not sql:
+        raise HTTPException(status_code=400, detail="Pick a client (BigQuery SOT), provide a custom SOT query, or a SOT tab.")
+    for label, q in (("SOT", sql), ("NPDB", npdb_sql)):
+        if not q: continue
+        if not re.match(r"(?is)^(with|select)\b", q):
+            raise HTTPException(status_code=400, detail=f"The {label} query must be a single SELECT (or WITH … SELECT) statement.")
+        if "@client" in q and not req.client:
+            raise HTTPException(status_code=400, detail=f"The {label} query references @client — pick a client too.")
     try:
-        sot_rows = bq_sot(req.client, cfg) if req.client else None
-        res = reconcile(_sid(req.sheet), req.sot_tab, req.npdb_tab, cfg, write=True, sot_rows=sot_rows)
+        if sql:
+            params = {"client": req.client} if "@client" in sql else None
+            sot_rows = bq_rows(sql, params, project=cfg.bq_project or DEFAULT_BQ_PROJECT)
+            if not sot_rows:
+                raise ValueError("The custom SOT query returned no rows.")
+            if "providerId" not in sot_rows[0]:
+                raise ValueError("The custom SOT query must return a providerId column "
+                                 "(plus firstName, lastName, npi, dateOfBirth, credentialingStatus, …).")
+        else:
+            sot_rows = bq_sot(req.client, cfg) if req.client else None
+        npdb_rows = None
+        if npdb_sql:
+            params = {"client": req.client} if "@client" in npdb_sql else None
+            npdb_rows = bq_rows(npdb_sql, params, project=cfg.bq_project or DEFAULT_BQ_PROJECT)
+            if not npdb_rows:
+                raise ValueError("The NPDB query returned no rows.")
+        res = reconcile(_sid(req.sheet), req.sot_tab, req.npdb_tab, cfg, write=True,
+                        sot_rows=sot_rows, npdb_rows=npdb_rows)
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly(e))
     return {"sheet_id": _sid(req.sheet), "total": res.total, "balanced": res.balanced,

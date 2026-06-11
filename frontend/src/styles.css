@@ -10,6 +10,11 @@ h1 { margin:0 0 4px; font-size:24px; }
 .sa code { background:#fff; border:1px solid var(--line); padding:6px 10px; border-radius:6px; flex:1; }
 label { display:block; font-weight:600; font-size:13px; margin:10px 0 6px; }
 input[type=text], input:not([type]), select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:7px; font-size:14px; }
+textarea { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:7px; font-size:13px; font-family:ui-monospace,Consolas,monospace; resize:vertical; margin-top:6px; }
+.seg { display:inline-flex; border:1px solid var(--line); border-radius:7px; overflow:hidden; margin-bottom:4px; }
+.seg button { background:#fff; color:#1c2430; border:0; border-radius:0; padding:8px 16px; font-size:13px; font-weight:600; }
+.seg button + button { border-left:1px solid var(--line); }
+.seg button.on { background:var(--b); color:#fff; }
 .row { display:flex; gap:10px; align-items:flex-end; }
 .row.two { gap:14px; }
 .row.two > div { flex:1; }
