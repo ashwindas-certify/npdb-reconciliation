@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional, List
-from reconcile_core import Config, get_service, list_tabs, reconcile, SA_EMAIL
+from reconcile_core import Config, get_service, list_tabs, reconcile, bq_sot, bq_clients, SA_EMAIL
 
 app = FastAPI(title="NPDB Reconciliation")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -26,9 +26,12 @@ def _sid(s: str) -> str:
 
 def _friendly(e: Exception) -> str:
     m = str(e)
-    if "403" in m or "permission" in m.lower() or "not have" in m.lower():
-        return "The service account can't open this sheet. Share it (Editor) with the SA address, then retry."
-    if "404" in m or "not found" in m.lower():
+    ml = m.lower()
+    if "default credentials" in ml or "could not automatically determine" in ml or "reauth" in ml:
+        return "Not logged in to BigQuery. In a terminal run:  gcloud auth application-default login"
+    if "403" in m or "permission" in ml or "not have" in ml:
+        return "Permission denied. For the sheet: share it (Editor) with the SA. For BigQuery: confirm your account can read the dataset."
+    if "404" in m or "not found" in ml:
         return "Sheet or tab not found — check the URL / tab names."
     return m[:300]
 
@@ -37,6 +40,13 @@ def health(): return {"ok": True}
 
 @app.get("/api/info")
 def info(): return {"sa_email": SA_EMAIL}
+
+@app.get("/api/clients")
+def clients():
+    try:
+        return {"clients": bq_clients(Config())}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=_friendly(e))
 
 @app.get("/api/tabs")
 def tabs(sheet: str):
@@ -48,9 +58,10 @@ def tabs(sheet: str):
         raise HTTPException(status_code=400, detail=_friendly(e))
 
 class RunReq(BaseModel):
-    sheet: str
-    sot_tab: str
+    sheet: str                       # the NPDB sheet (holds npdb_tab; receives result tabs)
     npdb_tab: str
+    client: Optional[str] = None     # organization name -> SOT pulled from BigQuery
+    sot_tab: Optional[str] = None    # legacy: read SOT from a tab instead of BigQuery
     active: Optional[List[str]] = None
     terminated: Optional[List[str]] = None
     npdb_active: Optional[List[str]] = None
@@ -65,8 +76,11 @@ def run(req: RunReq):
     if req.npdb_active:    cfg.npdb_active = {s.strip().lower() for s in req.npdb_active if s.strip()}
     if req.npdb_cancelled: cfg.npdb_cancelled = {s.strip().lower() for s in req.npdb_cancelled if s.strip()}
     if req.accept_score:   cfg.accept_score = float(req.accept_score)
+    if not req.client and not req.sot_tab:
+        raise HTTPException(status_code=400, detail="Pick a client (BigQuery SOT) or a SOT tab.")
     try:
-        res = reconcile(_sid(req.sheet), req.sot_tab, req.npdb_tab, cfg, write=True)
+        sot_rows = bq_sot(req.client, cfg) if req.client else None
+        res = reconcile(_sid(req.sheet), req.sot_tab, req.npdb_tab, cfg, write=True, sot_rows=sot_rows)
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly(e))
     return {"sheet_id": _sid(req.sheet), "total": res.total, "balanced": res.balanced,

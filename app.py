@@ -8,7 +8,7 @@ accounting summary is shown.
 import re
 import pandas as pd
 import streamlit as st
-from reconcile_core import Config, get_service, list_tabs, reconcile, SA_EMAIL
+from reconcile_core import Config, get_service, list_tabs, reconcile, bq_sot, bq_clients, SA_EMAIL
 
 st.set_page_config(page_title="NPDB Reconciliation", page_icon="🩺", layout="centered")
 st.title("🩺 NPDB Enrollment Reconciliation")
@@ -41,13 +41,28 @@ if sid:
             st.error(f"Couldn't open the sheet: {msg[:200]}")
 
 if tabs:
-    c1, c2 = st.columns(2)
     def _guess(names, want):
         for n in names:
             if want in n.lower(): return names.index(n)
         return 0
-    sot_tab  = c1.selectbox("SOT tab (providers)", tabs, index=_guess(tabs, "sot"))
-    npdb_tab = c2.selectbox("NPDB tab (enrollments)", tabs, index=_guess(tabs, "npdb"))
+    npdb_tab = st.selectbox("NPDB tab (enrollments) — in the sheet above", tabs, index=_guess(tabs, "npdb"))
+
+# 2b) client (SOT comes from BigQuery, filtered by organization name)
+@st.cache_data(show_spinner="Loading clients from BigQuery…")
+def _load_clients():
+    return bq_clients(Config())
+
+client = None
+try:
+    _clients = _load_clients()
+    client = st.selectbox("Step 3 — Client / organization (SOT from BigQuery)", _clients,
+                          index=None, placeholder="Pick a client…")
+except Exception as e:
+    msg = str(e)
+    if "default credentials" in msg.lower() or "reauth" in msg.lower():
+        st.error("Not logged in to BigQuery. In a terminal run:  `gcloud auth application-default login`")
+    else:
+        st.error(f"Couldn't load clients from BigQuery: {msg[:200]}")
 
 # 3) advanced config
 with st.expander("Advanced — status mappings & matching (optional)"):
@@ -74,15 +89,23 @@ def build_cfg():
 
 # 4) run
 st.divider()
-run = st.button("▶  Run Reconciliation", type="primary", disabled=not (sid and sot_tab and npdb_tab))
+run = st.button("▶  Run Reconciliation", type="primary", disabled=not (sid and npdb_tab and client))
 if run:
     status = st.empty()
     with st.spinner("Running…"):
         try:
-            res = reconcile(sid, sot_tab, npdb_tab, build_cfg(), write=True,
+            cfg = build_cfg()
+            status.write(f"⏳ Querying BigQuery for {client}…")
+            sot_rows = bq_sot(client, cfg)
+            res = reconcile(sid, None, npdb_tab, cfg, write=True, sot_rows=sot_rows,
                             progress=lambda m: status.write(f"⏳ {m}"))
         except Exception as e:
-            st.error(f"Run failed: {str(e)[:300]}"); st.stop()
+            msg = str(e)
+            if "default credentials" in msg.lower() or "reauth" in msg.lower():
+                st.error("Not logged in to BigQuery. Run:  `gcloud auth application-default login`")
+            else:
+                st.error(f"Run failed: {msg[:300]}")
+            st.stop()
     status.empty()
     st.success(f"Done ✓ — {res.total:,} providers · {res.action_count:,} need action · "
                f"{res.extra_enrollments:,} extra NPDB enrollments not in SOT · "
@@ -90,7 +113,8 @@ if run:
     st.markdown(f"**Results written to:** {', '.join('`'+t+'`' for t in res.written_tabs)}")
     st.link_button("Open Google Sheet ↗", f"https://docs.google.com/spreadsheets/d/{sid}")
 
-    # accounting table
-    df = pd.DataFrame([r for r in res.summary if any(str(c).strip() for c in r)], columns=["Bucket","Providers"])
-    st.subheader("Summary (accounting)")
+    # summary table (Label | Count | %/what-to-do)
+    df = pd.DataFrame([r for r in res.summary if any(str(c).strip() for c in r)],
+                      columns=["", "Count", "What to do / %"])
+    st.subheader("Summary")
     st.dataframe(df, use_container_width=True, hide_index=True)

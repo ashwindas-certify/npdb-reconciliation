@@ -10,8 +10,9 @@ export default function App() {
   const [saEmail, setSaEmail] = useState("");
   const [sheet, setSheet] = useState("");
   const [tabs, setTabs] = useState([]);
-  const [sot, setSot] = useState("");
   const [npdb, setNpdb] = useState("");
+  const [clients, setClients] = useState([]);
+  const [client, setClient] = useState("");
   const [loadingTabs, setLoadingTabs] = useState(false);
   const [running, setRunning] = useState(false);
   const [err, setErr] = useState("");
@@ -19,13 +20,17 @@ export default function App() {
   const [accept, setAccept] = useState(45);
 
   useEffect(() => { api("/api/info").then((d) => setSaEmail(d.sa_email)).catch(() => {}); }, []);
+  useEffect(() => {
+    api("/api/clients")
+      .then((d) => setClients(d.clients || []))
+      .catch((e) => setErr(e.message));
+  }, []);
 
   const loadTabs = async () => {
     setErr(""); setResult(null); setTabs([]); setLoadingTabs(true);
     try {
       const d = await api(`/api/tabs?sheet=${encodeURIComponent(sheet)}`);
       setTabs(d.tabs);
-      setSot(d.tabs.find((t) => t.toLowerCase().includes("sot")) || d.tabs[0] || "");
       setNpdb(d.tabs.find((t) => t.toLowerCase().includes("npdb")) || d.tabs[0] || "");
     } catch (e) { setErr(e.message); }
     setLoadingTabs(false);
@@ -37,7 +42,7 @@ export default function App() {
       const d = await api("/api/reconcile", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ sheet, sot_tab: sot, npdb_tab: npdb, accept_score: accept }),
+        body: JSON.stringify({ sheet, npdb_tab: npdb, client, accept_score: accept }),
       });
       setResult(d);
     } catch (e) { setErr(e.message); }
@@ -60,7 +65,7 @@ export default function App() {
       </div>
 
       <div className="card">
-        <label>Step 2 — Google Sheet URL or ID</label>
+        <label>Step 2 — NPDB report: Google Sheet URL or ID</label>
         <div className="row">
           <input value={sheet} onChange={(e) => setSheet(e.target.value)} placeholder="https://docs.google.com/spreadsheets/d/…" />
           <button onClick={loadTabs} disabled={!sheet || loadingTabs}>{loadingTabs ? "Loading…" : "Load tabs"}</button>
@@ -69,15 +74,16 @@ export default function App() {
         {tabs.length > 0 && (
           <div className="row two">
             <div>
-              <label>SOT tab (providers)</label>
-              <select value={sot} onChange={(e) => setSot(e.target.value)}>
+              <label>NPDB tab (enrollments)</label>
+              <select value={npdb} onChange={(e) => setNpdb(e.target.value)}>
                 {tabs.map((t) => <option key={t}>{t}</option>)}
               </select>
             </div>
             <div>
-              <label>NPDB tab (enrollments)</label>
-              <select value={npdb} onChange={(e) => setNpdb(e.target.value)}>
-                {tabs.map((t) => <option key={t}>{t}</option>)}
+              <label>Client / organization (SOT from BigQuery)</label>
+              <select value={client} onChange={(e) => setClient(e.target.value)}>
+                <option value="">{clients.length ? "Pick a client…" : "Loading…"}</option>
+                {clients.map((c) => <option key={c}>{c}</option>)}
               </select>
             </div>
           </div>
@@ -92,8 +98,8 @@ export default function App() {
           </details>
         )}
 
-        <button className="run" onClick={run} disabled={!sot || !npdb || running}>
-          {running ? "Running… (reads both tabs, matches, writes results)" : "▶  Run Reconciliation"}
+        <button className="run" onClick={run} disabled={!client || !npdb || running}>
+          {running ? "Running… (queries BigQuery, matches, writes results)" : "▶  Run Reconciliation"}
         </button>
       </div>
 
@@ -110,7 +116,9 @@ export default function App() {
             <tbody>
               {result.summary.filter((r) => (r[0] || "") !== "" || (r[1] || "") !== "").map((r, i) => (
                 <tr key={i} className={String(r[0]).startsWith("    ") ? "indent" : ""}>
-                  <td>{r[0]}</td><td className="num">{r[1] !== "" ? r[1] : ""}</td>
+                  <td>{r[0]}</td>
+                  <td className="num">{r[1] !== "" ? r[1] : ""}</td>
+                  <td className="note">{r[2] || ""}</td>
                 </tr>
               ))}
             </tbody>

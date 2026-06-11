@@ -26,5 +26,6 @@ button:disabled { opacity:.5; cursor:not-allowed; }
 .result td { padding:5px 8px; border-bottom:1px solid #eef1f5; }
 .result td.num { text-align:right; font-variant-numeric:tabular-nums; font-weight:600; }
 .result tr.indent td:first-child { color:#5a6573; padding-left:18px; font-weight:400; }
+.result td.note { color:#5a6573; font-size:12px; }
 .tabs { color:#5a6573; font-size:12px; margin:12px 0 0; }
 footer { text-align:center; color:#9aa4b2; font-size:12px; margin:24px 0; }
