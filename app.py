@@ -34,12 +34,11 @@ if mode == "Google Sheet tab":
 else:
     npdb_sql = st.text_area(
         "BigQuery SQL — NPDB report (one row per enrollment)", height=160,
-        placeholder=("SELECT first_name, last_name, npi, ssn, birthdate, license,\n"
-                     "       npdb_enrollment_status, data_bank_subject_id_number, …\n"
-                     "FROM `project.dataset.npdb_report`"))
-    st.caption("Single SELECT returning the NPDB report columns (First Name, Last Name, NPI, SSN, "
-               "Birthdate, License, NPDB Enrollment Status, Data Bank Subject ID Number, …). "
-               "BigQuery-style names (`first_name`, `npdb_enrollment_status`…) are mapped automatically. "
+        value=("SELECT * FROM `certifyos-production-platform.npdb_exports_test.practitioner_enrollments`\n"
+               "WHERE submitted_on_behalf_of_entity = 'NPDB Entity Name'"))
+    st.caption("Single SELECT returning the NPDB report columns. **Replace `'NPDB Entity Name'` with the client's "
+               "NPDB entity** (or edit the query as needed). `SELECT *` is fine — BigQuery-style names "
+               "(`first_name`, `npdb_enrollment_status`, `submitted_on_behalf_of_entity`…) are mapped automatically. "
                "Use `@client` to filter by the selected client.")
     url = st.text_input("Results sheet — Google Sheet URL or ID (result tabs are written here)")
 
@@ -121,6 +120,10 @@ sot_sql, npdb_q = _clean(sot_sql_txt), _clean(npdb_sql)
 needs_client = (not sot_sql) or ("@client" in sot_sql) or ("@client" in npdb_q)
 ready = bool(sid) and bool(npdb_tab if mode == "Google Sheet tab" else npdb_q) \
         and (bool(client) or not needs_client)
+make_client_wb = st.checkbox(
+    "Also create a separate client-facing workbook (summary + recon page), shared anyone-with-link",
+    value=False, help="A clean spreadsheet with just the client summary (charts) and a trimmed reconciliation page. "
+                      "The full detail tabs are still written to the results sheet above.")
 run = st.button("▶  Run Reconciliation", type="primary", disabled=not ready)
 if run:
     for label, q in (("SOT", sot_sql), ("NPDB", npdb_q)):
@@ -151,8 +154,10 @@ if run:
                                     project=DEFAULT_BQ_PROJECT, progress=_tick)
                 if not npdb_rows:
                     raise ValueError("The NPDB query returned no rows.")
+            cw_title = f"NPDB Reconciliation — {client}" if client else "NPDB Enrollment — Client Summary"
             res = reconcile(sid, None, npdb_tab, cfg, write=True, sot_rows=sot_rows, npdb_rows=npdb_rows,
-                            progress=lambda m: status.write(f"⏳ {m}"))
+                            progress=lambda m: status.write(f"⏳ {m}"),
+                            client_workbook=make_client_wb, client_workbook_title=cw_title)
         except Exception as e:
             msg = str(e)
             if "default credentials" in msg.lower() or "reauth" in msg.lower():
@@ -166,6 +171,11 @@ if run:
                f"Balanced: {'YES ✅' if res.balanced else 'NO ⚠️'}")
     st.markdown(f"**Results written to:** {', '.join('`'+t+'`' for t in res.written_tabs)}")
     st.link_button("Open Google Sheet ↗", f"https://docs.google.com/spreadsheets/d/{sid}")
+    if res.client_workbook_url:
+        st.success("Client-facing workbook created (anyone with the link can view).")
+        st.link_button("Open client workbook ↗", res.client_workbook_url)
+    elif make_client_wb:
+        st.warning("The client workbook couldn't be created — check the run log above (Drive API/scope).")
 
     # summary table (Label | Count | %/what-to-do)
     df = pd.DataFrame([r for r in res.summary if any(str(c).strip() for c in r)],

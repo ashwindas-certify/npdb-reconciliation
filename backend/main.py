@@ -72,6 +72,7 @@ class RunReq(BaseModel):
     npdb_active: Optional[List[str]] = None
     npdb_cancelled: Optional[List[str]] = None
     accept_score: Optional[float] = None
+    client_workbook: Optional[bool] = False   # also create a separate client-facing spreadsheet (summary + recon)
 
 @app.post("/api/reconcile")
 def run(req: RunReq):
@@ -110,13 +111,16 @@ def run(req: RunReq):
             npdb_rows = bq_rows(npdb_sql, params, project=cfg.bq_project or DEFAULT_BQ_PROJECT)
             if not npdb_rows:
                 raise ValueError("The NPDB query returned no rows.")
+        cw_title = f"NPDB Reconciliation — {req.client}" if req.client else "NPDB Enrollment — Client Summary"
         res = reconcile(_sid(req.sheet), req.sot_tab, req.npdb_tab, cfg, write=True,
-                        sot_rows=sot_rows, npdb_rows=npdb_rows)
+                        sot_rows=sot_rows, npdb_rows=npdb_rows,
+                        client_workbook=bool(req.client_workbook), client_workbook_title=cw_title)
     except Exception as e:
         raise HTTPException(status_code=400, detail=_friendly(e))
     return {"sheet_id": _sid(req.sheet), "total": res.total, "balanced": res.balanced,
             "action_count": res.action_count, "counts": res.counts,
-            "confidence": res.confidence, "written_tabs": res.written_tabs, "summary": res.summary}
+            "confidence": res.confidence, "written_tabs": res.written_tabs, "summary": res.summary,
+            "client_workbook_url": res.client_workbook_url}
 
 # ---- serve the built React SPA (if present) ----
 _STATIC = os.path.join(os.path.dirname(__file__), "static")

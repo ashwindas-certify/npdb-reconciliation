@@ -20,7 +20,9 @@ export default function App() {
   const [accept, setAccept] = useState(45);
   const [bqSql, setBqSql] = useState("");
   const [mode, setMode] = useState("sheet");   // NPDB source: "sheet" tab | "bq" query
-  const [npdbSql, setNpdbSql] = useState("");
+  const [npdbSql, setNpdbSql] = useState(
+    "SELECT * FROM `certifyos-production-platform.npdb_exports_test.practitioner_enrollments`\n" +
+    "WHERE submitted_on_behalf_of_entity = 'NPDB Entity Name'");
 
   useEffect(() => { api("/api/info").then((d) => setSaEmail(d.sa_email)).catch(() => {}); }, []);
   useEffect(() => {
@@ -113,12 +115,12 @@ export default function App() {
               onChange={(e) => setNpdbSql(e.target.value)}
               rows={7}
               spellCheck={false}
-              placeholder={"SELECT first_name, last_name, npi, ssn, birthdate, license,\n       npdb_enrollment_status, data_bank_subject_id_number, …\nFROM `project.dataset.npdb_report`"}
+              placeholder={"SELECT * FROM `certifyos-production-platform.npdb_exports_test.practitioner_enrollments`\nWHERE submitted_on_behalf_of_entity = 'NPDB Entity Name'"}
             />
             <small>
-              Single SELECT returning the NPDB report columns (First Name, Last Name, NPI, SSN,
-              Birthdate, License, NPDB Enrollment Status, Data Bank Subject ID Number, …).
-              BigQuery-style names (<code>first_name</code>, <code>npdb_enrollment_status</code>…)
+              Single SELECT returning the NPDB report columns. <b>Replace <code>'NPDB Entity Name'</code> with
+              the client's NPDB entity</b> (or edit as needed). <code>SELECT *</code> is fine — BigQuery-style
+              names (<code>first_name</code>, <code>npdb_enrollment_status</code>, <code>submitted_on_behalf_of_entity</code>…)
               are mapped automatically. Use <b>@client</b> to filter by the selected client.
             </small>
 

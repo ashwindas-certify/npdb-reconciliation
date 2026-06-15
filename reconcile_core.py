@@ -20,7 +20,8 @@ try:
 except ImportError:
     fuzz = None
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive.file"]   # drive.file = manage only files this app creates (the client workbook)
 SA_EMAIL = "sheet-access@create-494211.iam.gserviceaccount.com"   # share client sheets with this
 
 # ----------------- BigQuery SOT source (CertifyOS) -----------------
@@ -128,21 +129,29 @@ class Result:
     confidence: dict
     written_tabs: list
     extra_enrollments: int = 0    # NPDB enrollment records (persons) with no provider in the SOT
+    client_workbook_id: str = ""  # separate client-facing spreadsheet (summary + recon), if created
+    client_workbook_url: str = ""
 
 # ----------------------------- auth -------------------------------
-def get_service(sa_key_path: str | None = None):
+def _creds(sa_key_path: str | None = None):
     inline = os.environ.get("GOOGLE_SA_KEY_JSON")
     if inline:
-        info = json.loads(inline)
-        creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-    else:
-        path = sa_key_path or os.environ.get("GOOGLE_SA_KEY") or \
-               os.path.join(os.path.expanduser("~"), "Downloads", "create-494211-147f2005e4ac.json")
-        creds = service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+        return service_account.Credentials.from_service_account_info(json.loads(inline), scopes=SCOPES)
+    path = sa_key_path or os.environ.get("GOOGLE_SA_KEY") or \
+           os.path.join(os.path.expanduser("~"), "Downloads", "create-494211-147f2005e4ac.json")
+    return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+
+def _authed_http(creds):
     # large reads/writes (100K-row tabs) outlive the default 60s socket timeout
     import google_auth_httplib2, httplib2
-    authed = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
-    return build("sheets", "v4", http=authed, cache_discovery=False)
+    return google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=300))
+
+def get_service(sa_key_path: str | None = None):
+    return build("sheets", "v4", http=_authed_http(_creds(sa_key_path)), cache_discovery=False)
+
+def get_drive_service(sa_key_path: str | None = None):
+    """Drive client — used only to share the client workbook this app creates (drive.file scope)."""
+    return build("drive", "v3", http=_authed_http(_creds(sa_key_path)), cache_discovery=False)
 
 # --------------------------- BigQuery (SOT source) ---------------------------
 # Auth is YOUR local Application Default Credentials — NO service account needed.
@@ -296,11 +305,17 @@ def _detect_col(keys, exacts, contains_all=(), contains_any=(), avoid=()):
 # ----------------------------- core -------------------------------
 def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Config | None = None,
               write: bool = True, progress=lambda m: None, sot_rows: list | None = None,
-              npdb_rows: list | None = None) -> Result:
+              npdb_rows: list | None = None,
+              client_workbook: bool = False, client_workbook_title: str | None = None) -> Result:
     """`sheet_id` receives the result tabs. SOT comes from either a tab in that sheet
     (`sot_tab`) OR pre-fetched rows passed as `sot_rows` (e.g. from BigQuery via
     bq_sot(client, cfg)) — exactly one of the two. Likewise the NPDB report comes from
-    either `npdb_tab` (a tab of the sheet) OR pre-fetched `npdb_rows` (e.g. from BigQuery)."""
+    either `npdb_tab` (a tab of the sheet) OR pre-fetched `npdb_rows` (e.g. from BigQuery).
+
+    If `client_workbook` is set, a separate, clean client-facing spreadsheet is also created
+    (the client summary tab with charts + a trimmed reconciliation page), shared anyone-with-link,
+    and its id/url returned on the Result. The full internal result tabs are still written to
+    `sheet_id` as usual."""
     cfg = cfg or Config()
     if sot_rows is None and not sot_tab:
         raise ValueError("provide sot_tab (read from sheet) or sot_rows (e.g. from BigQuery)")
@@ -488,10 +503,21 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
+    client_recon = []          # trimmed, plain-language reconciliation for the client workbook
     counts, acct, confc = Counter(), Counter(), Counter()
+    xtab = Counter()           # client cross-tab: (credentialing category, enrollment outcome) -> providers
     n_conflict = 0
     matched_any = set()        # NPDB row indices claimed by some SOT provider (for the reverse pass)
     ACTIONABLE = {"MISSING_ENROLLMENT","DUPLICATE_ENROLLMENT","SHOULD_BE_CANCELLED","DATABANK_ID_OUT_OF_SYNC"}
+    # plain-language labels for the client reconciliation page
+    EXPECT_FRIENDLY = {"expects_active": "Yes", "terminated": "No — terminated",
+                       "delegated": "No — delegated", "in_progress": "Pending"}
+    ACTION_FRIENDLY = {"MISSING_ENROLLMENT": "Enroll provider in NPDB",
+                       "DUPLICATE_ENROLLMENT": "Cancel duplicate enrollments (keep oldest)",
+                       "SHOULD_BE_CANCELLED": "Cancel active NPDB enrollment",
+                       "DATABANK_ID_OUT_OF_SYNC": "Update databank ID"}
+    CLIENT_RECON_HDR = ["provider_name", "npi", "credentialing_status", "expected_npdb_enrollment",
+                        "npdb_enrollment_status", "active_enrollments", "result", "action_needed", "npdb_databank_id"]
     # NPDB data points each row was compared against (matched record)
     NPDB_HDR  = ["npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_databank_id","npdb_enroll_status",
                  "npdb_entity","npdb_enroll_start","npdb_cancel_date","npdb_cancelled_by"]
@@ -545,6 +571,19 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             bucket = "IN_PROGRESS"
         acct[bucket] += 1; confc[conf] += 1
 
+        # client cross-tab — credentialing status (rows) vs NPDB enrollment outcome (cols).
+        # Mutually exclusive, so the matrix sums to the provider total.
+        if expect == "delegated":      cred_cat = "Delegated"
+        elif expect == "terminated":   cred_cat = "Terminated / Denied"
+        elif cyc in cfg.recred_cycles: cred_cat = "Recredentialing"
+        elif cls == "active":          cred_cat = "Credentialed (Approved)"
+        else:                          cred_cat = "In progress"
+        if   n_enr > 1:  outcome = "Multiple active"
+        elif n_enr == 1: outcome = "Active enrollment"
+        elif n_can >= 1: outcome = "Cancelled only"
+        else:            outcome = "No NPDB enrollment"
+        xtab[(cred_cat, outcome)] += 1
+
         flags = []
         if expect == "expects_active":
             if n_enr == 0:  flags.append("MISSING_ENROLLMENT")
@@ -570,6 +609,12 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                     n_enr, n_can, n_oth, statuses, sot_db, ", ".join(npdb_ids),
                     ("Y" if (sot_db and sot_db in npdb_ids) else ("N" if matched else "")),
                     suggested_db, " | ".join(flags), *npdb_pts(prim)])
+        # trimmed, plain-language row for the client workbook
+        acts_friendly = [ACTION_FRIENDLY[f] for f in flags if f in ACTION_FRIENDLY]
+        action_txt = "; ".join(acts_friendly) if acts_friendly else \
+                     ("Review identity" if "REVIEW_IDENTITY" in flags else "None")
+        client_recon.append([pname, npi, cs, EXPECT_FRIENDLY.get(expect, expect),
+                             statuses or "(none)", n_enr, outcome, action_txt, ", ".join(npdb_ids)])
         if "DUPLICATE_ENROLLMENT" in flags:
             active_ms = sorted([m for m in matched if m["enroll_class"] == "active"], key=_start_ts)
             for j, m in enumerate(active_ms):   # oldest first -> retain it (max history)
@@ -737,8 +782,51 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     ]
     summary = [[label, value, note] for _style, label, value, note in SUMMARY_SPEC]
 
+    # ---------------- client-facing summary (plain-language KPIs + cross-tab + charts) ----------------
+    # A single, presentable tab the client can read at a glance: headline figures, a credentialing-status
+    # x enrollment-status matrix, and two native charts. The detail/audit tabs stay as-is.
+    OUT_COLS  = ["Active enrollment", "Multiple active", "Cancelled only", "No NPDB enrollment"]
+    CRED_ROWS = ["Credentialed (Approved)", "Recredentialing", "Terminated / Denied"]
+    if forcred_col: CRED_ROWS.append("Delegated")
+    CRED_ROWS.append("In progress")
+    n_expected = n_active                       # providers we expect to hold an active enrollment
+    exp_ok     = acct["EXP_OK"]
+    exp_attn   = acct["EXP_MISSING"] + acct["EXP_DUPLICATE"]
+    def epct(x): return f"{round(100*x/n_expected)}%" if n_expected else ""
+
+    client_spec, client_summary = [], []
+    def _c(style, *cells):
+        client_spec.append(style); client_summary.append(list(cells))
+    _c("title",  "NPDB Enrollment — Client Summary")
+    _c("blank",  "")
+    _c("kpi",    "Providers reviewed", total, "")
+    _c("normal", "Expected to hold an active NPDB enrollment", n_expected, epct(n_expected))
+    _c(("good" if exp_attn == 0 else "normal"), "    correctly enrolled (exactly one active)", exp_ok, epct(exp_ok))
+    _c(("bad"  if exp_attn else "good"), "    need attention (missing or duplicate)", exp_attn, epct(exp_attn))
+    _c(("bad"  if action_total else "good"), "Items needing action (all categories)", action_total, pct(action_total))
+    _c("blank",  "")
+    _c("section", "Credentialing status vs NPDB enrollment status")
+    cl_mhdr = len(client_summary)
+    _c("colhdr", "Credentialing status", *OUT_COLS, "Total")
+    for cat in CRED_ROWS:
+        vals = [xtab[(cat, oc)] for oc in OUT_COLS]
+        _c("matrix", cat, *vals, sum(vals))
+    cl_mlast = len(client_summary) - 1
+    col_tot = [sum(xtab[(cat, oc)] for cat in CRED_ROWS) for oc in OUT_COLS]
+    _c("total", "Total", *col_tot, sum(col_tot))
+    _c("blank",  "")
+    _c("section", "Enrollment compliance — providers expected to be enrolled")
+    _c("colhdr", "Status", "Providers", "% of expected")
+    cl_pfirst = len(client_summary)
+    _c("good", "Correctly enrolled (one active)", exp_ok, epct(exp_ok))
+    _c("warn", "Missing enrollment", acct["EXP_MISSING"], epct(acct["EXP_MISSING"]))
+    _c("bad",  "Duplicate (more than one active)", acct["EXP_DUPLICATE"], epct(acct["EXP_DUPLICATE"]))
+    cl_plast = len(client_summary) - 1
+    client_layout = {"mhdr": cl_mhdr, "mlast": cl_mlast, "ncols": len(OUT_COLS),
+                     "pfirst": cl_pfirst, "plast": cl_plast}
+
     headers = {
-        "summary": None, "readme": None,
+        "summary": None, "client_summary": None, "readme": None,
         "reconciliation": ["providerId","provider_name","npi","credentialingStatus","credentialingCycle",
             "status_class","expectation","match_tier","match_score","match_confidence","identity_conflict",
             "npdb_rows_matched","active_enrollments","cancelled_enrollments","other_enrollments","npdb_statuses",
@@ -761,17 +849,19 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "append_providerId","append_firstName","append_lastName","append_middleName","append_npi",
             "append_dateOfBirth","append_ssn_last4","append_license","append_license_state"],
     }
-    data = {"summary": summary, "action_items_all": action_all, "missing_enrollment": missing_rows,
+    data = {"summary": summary, "client_summary": client_summary,
+            "action_items_all": action_all, "missing_enrollment": missing_rows,
             "should_be_cancelled": cancel_rows, "duplicates": dups, "databank_updates": db_updates,
             "extra_enrollments": extra_rows, "reconciliation": out}
 
     written = []
+    cw_id = cw_url = ""
     if write:
         progress("Writing result tabs…")
         meta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id).execute(), "meta")
         existing = {s["properties"]["title"] for s in meta["sheets"]}
         sheet_ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
-        order = ["readme","summary","action_items_all","missing_enrollment","should_be_cancelled",
+        order = ["readme","summary","client_summary","action_items_all","missing_enrollment","should_be_cancelled",
                  "duplicates","databank_updates","extra_enrollments","reconciliation"]
         # remove old TitleCase result tabs (renamed to snake_case)
         old_titlecase = {"README","Summary","Action_Items_All","Missing_Enrollment",
@@ -865,9 +955,33 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                 body={"requests": _summary_format_reqs(sheet_ids["summary"], SUMMARY_SPEC)}).execute(),
                 "format summary")
 
+        # format the client summary and embed its charts (delete prior charts first so re-runs don't stack them)
+        if "client_summary" in sheet_ids:
+            progress("Formatting client summary tab…")
+            cmeta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id,
+                fields="sheets(properties(sheetId,title),charts(chartId))").execute(), "client charts meta")
+            old_charts = next(([c["chartId"] for c in s.get("charts", [])]
+                               for s in cmeta.get("sheets", [])
+                               if s["properties"]["title"] == "client_summary"), [])
+            reqs = [{"deleteEmbeddedObject": {"objectId": cid}} for cid in old_charts]
+            reqs += _client_summary_reqs(sheet_ids["client_summary"], client_spec, client_summary, client_layout)
+            _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
+                body={"requests": reqs}).execute(), "format client summary")
+
+        # separate, clean client-facing spreadsheet (summary + trimmed recon), shared anyone-with-link
+        if client_workbook:
+            try:
+                cw_id, cw_url = export_client_workbook(
+                    client_workbook_title or "NPDB Enrollment — Client Summary",
+                    client_summary, client_spec, client_layout,
+                    CLIENT_RECON_HDR, client_recon, cfg, progress=progress)
+                progress(f"Client workbook: {cw_url}")
+            except Exception as e:
+                progress(f"⚠ Client workbook export failed: {str(e)[:200]}")
+
     return Result(total=total, balanced=(tie == total), action_count=len(action_all),
                   summary=summary, counts=dict(counts), confidence=dict(confc), written_tabs=written,
-                  extra_enrollments=len(extra_groups))
+                  extra_enrollments=len(extra_groups), client_workbook_id=cw_id, client_workbook_url=cw_url)
 
 def _summary_format_reqs(sid, spec):
     """Google-Sheets batchUpdate requests that turn the raw `summary` tab into a banded,
@@ -954,6 +1068,190 @@ def _summary_format_reqs(sid, spec):
         "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}})
     return reqs
 
+def export_client_workbook(title, client_summary, client_spec, client_layout,
+                           recon_header, recon_rows, cfg, share_anyone=True, progress=lambda m: None):
+    """Create a fresh, client-facing spreadsheet holding just the client_summary tab (with charts)
+    and a trimmed reconciliation page (split into _2, _3… past the row cap). Shares it
+    anyone-with-link (viewer) via Drive. Returns (spreadsheet_id, spreadsheet_url)."""
+    svc = get_service(cfg.sa_key_path)
+    progress("Creating client workbook…")
+    ss = _retry(lambda: svc.spreadsheets().create(
+        body={"properties": {"title": title}}).execute(), "create workbook")
+    new_id, new_url = ss["spreadsheetId"], ss["spreadsheetUrl"]
+    first_id = ss["sheets"][0]["properties"]["sheetId"]
+
+    # plan: client_summary (no header) then client_reconciliation, split past the row cap
+    cap = cfg.max_rows_per_tab
+    if cap and len(recon_rows) > cap:
+        rchunks = [((("client_reconciliation" if i == 0 else f"client_reconciliation_{i//cap+1}")),
+                    recon_rows[i:i+cap]) for i in range(0, len(recon_rows), cap)]
+    else:
+        rchunks = [("client_reconciliation", recon_rows)]
+    plan = [("client_summary", None, client_summary)] + [(t, recon_header, c) for t, c in rchunks]
+
+    # rename the default sheet to the first tab, add the rest in one batch
+    add_reqs = [{"updateSheetProperties": {"properties": {"sheetId": first_id, "title": plan[0][0]},
+                 "fields": "title"}}]
+    add_reqs += [{"addSheet": {"properties": {"title": t}}} for t, _, _ in plan[1:]]
+    resp = _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=new_id,
+        body={"requests": add_reqs}).execute(), "add workbook tabs")
+    sheet_ids = {plan[0][0]: first_id}
+    for r in resp.get("replies", []):
+        if "addSheet" in r:
+            p = r["addSheet"]["properties"]; sheet_ids[p["title"]] = p["sheetId"]
+
+    for tname, hdr, chunk in plan:
+        body = ([hdr] + chunk) if hdr else chunk
+        width = max((len(r) for r in body), default=1)
+        _retry(lambda t=tname, rr=max(len(body), 2), cc=max(width, 1):
+            svc.spreadsheets().batchUpdate(spreadsheetId=new_id, body={"requests": [
+                {"updateSheetProperties": {"properties": {"sheetId": sheet_ids[t],
+                    "gridProperties": {"rowCount": rr, "columnCount": cc}},
+                 "fields": "gridProperties(rowCount,columnCount)"}}]}).execute(), f"size {tname}")
+        for start in range(0, len(body), 20000):
+            _retry(lambda t=tname, pp=body[start:start+20000], s=start:
+                svc.spreadsheets().values().update(spreadsheetId=new_id, range=f"'{t}'!A{s+1}",
+                    valueInputOption="RAW", body={"values": pp}).execute(), f"write {tname}")
+
+    progress("Formatting client workbook…")
+    _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=new_id, body={"requests":
+        _client_summary_reqs(sheet_ids["client_summary"], client_spec, client_summary, client_layout)}).execute(),
+        "format client summary")
+    recon_reqs = []
+    for t, sid_t in sheet_ids.items():
+        if t.startswith("client_reconciliation"):
+            recon_reqs += _recon_header_reqs(sid_t, len(recon_header))
+    if recon_reqs:
+        _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=new_id,
+            body={"requests": recon_reqs}).execute(), "format recon page")
+
+    if share_anyone:
+        try:
+            drive = get_drive_service(cfg.sa_key_path)
+            _retry(lambda: drive.permissions().create(fileId=new_id,
+                body={"type": "anyone", "role": "reader"}).execute(), "share workbook")
+            progress("Client workbook shared — anyone with the link can view.")
+        except Exception as e:
+            progress(f"⚠ Couldn't auto-share the workbook ({str(e)[:140]}); share it manually in Drive.")
+    return new_id, new_url
+
+def _recon_header_reqs(sid, ncols):
+    """Bold/banner + freeze the header row of a client reconciliation page and auto-size its columns."""
+    def rgb(h):
+        h = h.lstrip("#")
+        return {"red": int(h[0:2],16)/255, "green": int(h[2:4],16)/255, "blue": int(h[4:6],16)/255}
+    MIDBLUE, WHITE = rgb("2f6da3"), rgb("ffffff")
+    return [
+        {"repeatCell": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+            "startColumnIndex": 0, "endColumnIndex": ncols},
+            "cell": {"userEnteredFormat": {"backgroundColor": MIDBLUE,
+                "textFormat": {"bold": True, "foregroundColor": WHITE}}},
+            "fields": "userEnteredFormat(backgroundColor,textFormat)"}},
+        {"updateSheetProperties": {"properties": {"sheetId": sid,
+            "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}},
+        {"autoResizeDimensions": {"dimensions": {"sheetId": sid, "dimension": "COLUMNS",
+            "startIndex": 0, "endIndex": ncols}}},
+    ]
+
+def _client_summary_reqs(sid, spec, rows, lay):
+    """batchUpdate requests for the client_summary tab: band/color the KPI + cross-tab rows,
+    then embed a stacked column chart (credentialing status x enrollment outcome) and a pie
+    chart (enrollment compliance among expected providers). `lay` carries the row/col anchors
+    of the matrix and the pie data block so the chart source ranges are exact."""
+    def rgb(h):
+        h = h.lstrip("#")
+        return {"red": int(h[0:2],16)/255, "green": int(h[2:4],16)/255, "blue": int(h[4:6],16)/255}
+    BLUE, MIDBLUE, LBLUE, GRAY = rgb("1f4e78"), rgb("2f6da3"), rgb("eaf1f8"), rgb("f1f4f9")
+    WHITE, BLACK, MUTED, BORDER = rgb("ffffff"), rgb("202a36"), rgb("5a6573"), rgb("c9d3df")
+    GBG, GFG = rgb("e6f4ea"), rgb("137333")
+    ABG, AFG = rgb("fef7e0"), rgb("8a5a00")
+    RBG, RFG = rgb("fce8e6"), rgb("c5221f")
+    n  = len(rows)
+    NC = max((len(r) for r in rows), default=1)   # widest row = matrix width (6)
+
+    def fmt(bg=WHITE, fg=BLACK, bold=False, italic=False, size=10, halign="LEFT"):
+        return {"backgroundColor": bg, "horizontalAlignment": halign, "verticalAlignment": "MIDDLE",
+                "textFormat": {"bold": bold, "italic": italic, "foregroundColor": fg, "fontSize": size}}
+    STYLE = {
+        "blank":   fmt(),
+        "normal":  fmt(),
+        "matrix":  fmt(),
+        "sub":     fmt(fg=MUTED, italic=True),
+        "section": fmt(bg=LBLUE, bold=True),
+        "kpi":     fmt(bg=GRAY, bold=True, size=11),
+        "total":   fmt(bg=GRAY, bold=True),
+        "good":    fmt(bg=GBG, fg=GFG, bold=True),
+        "warn":    fmt(bg=ABG, fg=AFG, bold=True),
+        "bad":     fmt(bg=RBG, fg=RFG, bold=True),
+        "colhdr":  fmt(bg=MIDBLUE, fg=WHITE, bold=True),
+        "title":   fmt(bg=BLUE, fg=WHITE, bold=True, size=13, halign="CENTER"),
+    }
+    full = {"sheetId": sid, "startRowIndex": 0, "endRowIndex": n, "startColumnIndex": 0, "endColumnIndex": NC}
+    # widen the grid so the charts (anchored to the right of the table) have somewhere to live
+    reqs = [
+        {"updateSheetProperties": {"properties": {"sheetId": sid,
+            "gridProperties": {"rowCount": max(n, lay["plast"]) + 40, "columnCount": 24}},
+            "fields": "gridProperties(rowCount,columnCount)"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 320}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 1, "endIndex": NC},
+            "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
+        {"updateBorders": {"range": full, "top": {"style": "NONE"}, "bottom": {"style": "NONE"},
+            "left": {"style": "NONE"}, "right": {"style": "NONE"},
+            "innerHorizontal": {"style": "NONE"}, "innerVertical": {"style": "NONE"}}},
+    ]
+    for i, (style, _row) in enumerate(zip(spec, rows)):
+        reqs.append({"repeatCell": {
+            "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1, "startColumnIndex": 0, "endColumnIndex": NC},
+            "cell": {"userEnteredFormat": STYLE[style]},
+            "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"}})
+    # numeric columns (everything right of the label): right-aligned, thousands separators
+    reqs.append({"repeatCell": {
+        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n, "startColumnIndex": 1, "endColumnIndex": NC},
+        "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT",
+            "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}},
+        "fields": "userEnteredFormat(horizontalAlignment,numberFormat)"}})
+    # title banner across all columns; outer box; freeze the banner
+    reqs.append({"mergeCells": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+        "startColumnIndex": 0, "endColumnIndex": NC}, "mergeType": "MERGE_ALL"}})
+    reqs.append({"updateBorders": {"range": full,
+        "top": {"style": "SOLID", "color": BORDER}, "bottom": {"style": "SOLID", "color": BORDER},
+        "left": {"style": "SOLID", "color": BORDER}, "right": {"style": "SOLID", "color": BORDER}}})
+    reqs.append({"updateBorders": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
+        "startColumnIndex": 0, "endColumnIndex": NC}, "bottom": {"style": "SOLID_THICK", "color": MIDBLUE}}})
+    reqs.append({"updateSheetProperties": {"properties": {"sheetId": sid,
+        "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}})
+
+    # ---- charts ----
+    def src(col, r0, r1):
+        return {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1,
+                "startColumnIndex": col, "endColumnIndex": col + 1}
+    mhdr, mlast = lay["mhdr"], lay["mlast"]      # header row + last matrix data row (Total row excluded)
+    anchor_col = NC + 1                          # park charts just right of the table
+    # stacked column: domain = credentialing-status labels, one series per enrollment outcome
+    reqs.append({"addChart": {"chart": {
+        "spec": {"title": "Credentialing status vs NPDB enrollment status",
+            "basicChart": {"chartType": "COLUMN", "stackedType": "STACKED",
+                "legendPosition": "BOTTOM_LEGEND", "headerCount": 1,
+                "axis": [{"position": "BOTTOM_AXIS", "title": "Credentialing status"},
+                         {"position": "LEFT_AXIS", "title": "Providers"}],
+                "domains": [{"domain": {"sourceRange": {"sources": [src(0, mhdr, mlast + 1)]}}}],
+                "series": [{"series": {"sourceRange": {"sources": [src(j, mhdr, mlast + 1)]}},
+                            "targetAxis": "LEFT_AXIS"} for j in range(1, lay["ncols"] + 1)]}},
+        "position": {"overlayPosition": {
+            "anchorCell": {"sheetId": sid, "rowIndex": mhdr, "columnIndex": anchor_col},
+            "offsetXPixels": 10, "widthPixels": 660, "heightPixels": 360}}}}})
+    # pie: enrollment compliance among providers expected to be enrolled
+    reqs.append({"addChart": {"chart": {
+        "spec": {"title": "Expected providers — enrollment compliance",
+            "pieChart": {"legendPosition": "RIGHT_LEGEND", "pieHole": 0.4,
+                "domain": {"sourceRange": {"sources": [src(0, lay["pfirst"], lay["plast"] + 1)]}},
+                "series": {"sourceRange": {"sources": [src(1, lay["pfirst"], lay["plast"] + 1)]}}}},
+        "position": {"overlayPosition": {
+            "anchorCell": {"sheetId": sid, "rowIndex": mhdr + 19, "columnIndex": anchor_col},
+            "offsetXPixels": 10, "widthPixels": 520, "heightPixels": 320}}}}})
+    return reqs
+
 def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False):
     sot_src = "pulled from BigQuery for the selected client" if sot_from_bq \
               else f"read from the '{sot_tab}' tab"
@@ -973,6 +1271,8 @@ def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False):
         "  Each provider is matched to their NPDB record on multiple identity fields (see Methodology).",
         "",
         "RESULT TABS",
+        "  client_summary       Client-facing overview: plain-language KPIs plus charts of credentialing",
+        "                       status vs NPDB enrollment status, and enrollment compliance.",
         "  summary              Headline figures and the actions required.",
         "  missing_enrollment   Should be enrolled but is not (or not active) — we enroll the provider.",
         "  duplicates           More than one active enrollment — we cancel the extras, keeping the oldest.",
