@@ -108,6 +108,12 @@ class Config:
     sot_for_cred_col: str | None      = None   # businessPurpose_isForCredentialing col (only some SOTs);
                                                # true -> direct provider (expect enrollment), false -> delegated (no enrollment)
     npdb_gender_field: str | None     = None   # gender/sex field in the NPDB report (auto-detected; usually 'Sex')
+    # client_summary issue-type sections to include (toggle per client). Keys:
+    #   missing     — Active, Non-Delegated providers not enrolled
+    #   terminated  — Terminated/Cancelled/Denied providers still actively enrolled
+    #   delegated   — Delegated providers still actively enrolled
+    #   duplicates  — providers with more than one active enrollment
+    client_issue_types: set  = field(default_factory=lambda: {"missing","terminated","delegated","duplicates"})
     max_rows_per_tab: int    = 100000      # split a result tab into <name>_2, _3… past this many rows (0 = never)
     cell_budget: int         = 9_000_000   # stay under Sheets' 10M-cells-per-spreadsheet cap; biggest
                                            # tabs are trimmed (with a readme note) rather than erroring
@@ -494,16 +500,28 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         if best is None or bs < cfg.accept_score:
             return [], "", 0, "UNMATCHED", ""
         conf = _confidence(bb)
+        # identity conflict — the NPI matched but a core identity field disagrees. Describe WHICH
+        # field(s) and the conflicting values, so a reviewer can see exactly why it was flagged.
         conflict = ""
-        if "npi" in bb and ((best["last"] and pi["last"] and bln < 60)
-                            or (best["dob"] and pi["dob"] and best["dob"] != pi["dob"])
-                            or ("gender_mismatch" in bb)):
-            conflict = "NPI_MATCH_IDENTITY_DIFFERS"
+        if "npi" in bb:
+            reasons = []
+            if best["last"] and pi["last"] and bln < 60:
+                reasons.append(f"last name differs (ours '{p.get('lastName','')}' vs NPDB '{best['raw_last']}')")
+            if best["dob"] and pi["dob"] and best["dob"] != pi["dob"]:
+                reasons.append(f"date of birth differs (ours {pi['dob']} vs NPDB {best['dob']})")
+            if "gender_mismatch" in bb:
+                reasons.append(f"gender differs (ours {pi['gender']} vs NPDB {best['gender']})")
+            conflict = "; ".join(reasons)
         idxs = by_npi.get(best["npi"], []) if best["npi"] else [bi]
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
     client_recon = []          # trimmed, plain-language reconciliation for the client workbook
+    # client_summary breakdowns (counts only): expected providers by credentialingStatus x NPDB
+    # status, and issues by issue-type x NPDB status. (extra issues are folded in after the loop.)
+    xtab_exp, xtab_issue = Counter(), Counter()
+    # client_issues page: clean provider rows per issue type (stacked tables on a separate tab)
+    cli_missing, cli_term, cli_deleg, cli_dup, cli_identity = [], [], [], [], []
     counts, acct, confc = Counter(), Counter(), Counter()
     xtab = Counter()           # client cross-tab: (credentialing category, enrollment outcome) -> providers
     n_conflict = 0
@@ -571,18 +589,24 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             bucket = "IN_PROGRESS"
         acct[bucket] += 1; confc[conf] += 1
 
-        # client cross-tab — credentialing status (rows) vs NPDB enrollment outcome (cols).
-        # Mutually exclusive, so the matrix sums to the provider total.
-        if expect == "delegated":      cred_cat = "Delegated"
-        elif expect == "terminated":   cred_cat = "Terminated / Denied"
-        elif cyc in cfg.recred_cycles: cred_cat = "Recredentialing"
-        elif cls == "active":          cred_cat = "Credentialed (Approved)"
-        else:                          cred_cat = "In progress"
+        # enrollment outcome — used by the client reconciliation 'result' column
         if   n_enr > 1:  outcome = "Multiple active"
         elif n_enr == 1: outcome = "Active enrollment"
         elif n_can >= 1: outcome = "Cancelled only"
         else:            outcome = "No NPDB enrollment"
-        xtab[(cred_cat, outcome)] += 1
+        # client cross-tab — provider BUCKET (delegation x active/terminated) vs RAW NPDB
+        # enrollment status (the provider's primary matched enrollment; 'No NPDB record' when
+        # unmatched). One provider counted once, so the matrix sums to the provider total.
+        delegation = "Delegated" if fc is False else "Non-Delegated"   # for_cred: False=delegated
+        if cls == "terminated":
+            credstate = "Terminated"
+        elif cls == "active" or cyc in cfg.recred_cycles:
+            credstate = "Active"
+        else:
+            credstate = "In progress"
+        bucket = f"{delegation} ({credstate})"
+        npdb_label = (str(prim["enroll_status"]).strip() or "(blank)") if prim else "No NPDB record"
+        xtab[(bucket, npdb_label)] += 1
 
         flags = []
         if expect == "expects_active":
@@ -615,6 +639,35 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                      ("Review identity" if "REVIEW_IDENTITY" in flags else "None")
         client_recon.append([pname, npi, cs, EXPECT_FRIENDLY.get(expect, expect),
                              statuses or "(none)", n_enr, outcome, action_txt, ", ".join(npdb_ids)])
+        # client_summary breakdowns + client_issues tables (`delegation`/`npdb_label` set above).
+        # Expected = Active, Non-Delegated (credentialed/recredentialing, not delegated) -> should be enrolled.
+        ids_str = ", ".join(npdb_ids); entity_str = prim["entity"] if prim else ""
+        p_start = prim["enroll_start"] if prim else ""        # enrollment dates from the matched record
+        p_cancel = prim["cancel_date"] if prim else ""
+        p_cancelby = prim["cancelled_by"] if prim else ""
+        if delegation == "Non-Delegated" and expect == "expects_active":
+            xtab_exp[(cs.strip() or "(blank)", npdb_label)] += 1
+            if n_enr == 0:
+                xtab_issue[("missing", npdb_label)] += 1
+                cli_missing.append([pname, npi, cs, cyc_raw, (statuses or "No NPDB record"),
+                                    (sot_db or suggested_db or ""), p_start, p_cancel, p_cancelby])
+            elif n_enr > 1:
+                xtab_issue[("duplicates", npdb_label)] += 1
+                cli_dup.append([pname, npi, cs, cyc_raw, n_enr, ids_str, p_start])
+        if expect == "terminated" and n_enr >= 1:
+            xtab_issue[("terminated", npdb_label)] += 1
+            cli_term.append([pname, npi, cs, cyc_raw, (statuses or "enrolled"), ids_str, entity_str,
+                             p_start, p_cancel, p_cancelby])
+        if expect == "delegated" and n_enr >= 1:
+            xtab_issue[("delegated", npdb_label)] += 1
+            cli_deleg.append([pname, npi, cs, cyc_raw, (statuses or "enrolled"), ids_str, entity_str,
+                              p_start, p_cancel, p_cancelby])
+        if conflict:
+            xtab_issue[("identity", npdb_label)] += 1
+            npdb_nm = f"{prim['raw_last']}, {prim['raw_first']}".strip(", ") if prim else ""
+            cli_identity.append([pname, npi, cs, cyc_raw, conflict, npdb_nm, p_start, p_cancel, p_cancelby])
+        if "DATABANK_ID_OUT_OF_SYNC" in flags:
+            xtab_issue[("databank", npdb_label)] += 1
         if "DUPLICATE_ENROLLMENT" in flags:
             active_ms = sorted([m for m in matched if m["enroll_class"] == "active"], key=_start_ts)
             for j, m in enumerate(active_ms):   # oldest first -> retain it (max history)
@@ -782,51 +835,118 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     ]
     summary = [[label, value, note] for _style, label, value, note in SUMMARY_SPEC]
 
-    # ---------------- client-facing summary (plain-language KPIs + cross-tab + charts) ----------------
-    # A single, presentable tab the client can read at a glance: headline figures, a credentialing-status
-    # x enrollment-status matrix, and two native charts. The detail/audit tabs stay as-is.
-    OUT_COLS  = ["Active enrollment", "Multiple active", "Cancelled only", "No NPDB enrollment"]
-    CRED_ROWS = ["Credentialed (Approved)", "Recredentialing", "Terminated / Denied"]
-    if forcred_col: CRED_ROWS.append("Delegated")
-    CRED_ROWS.append("In progress")
-    n_expected = n_active                       # providers we expect to hold an active enrollment
-    exp_ok     = acct["EXP_OK"]
-    exp_attn   = acct["EXP_MISSING"] + acct["EXP_DUPLICATE"]
-    def epct(x): return f"{round(100*x/n_expected)}%" if n_expected else ""
+    # ============ client-facing summary (KPIs + two breakdowns) + a detail page (per-issue tables) ============
+    # Expected = Active, Non-Delegated providers (credentialed/recredentialing, NOT delegated) — the
+    # providers who SHOULD hold an active NPDB enrollment. Terminated and Delegated providers are not
+    # expected to be enrolled, so they don't count toward "expected" (they show under issues if enrolled).
+    EXP_BUCKET = "Non-Delegated (Active)"
+    n_expected = sum(v for (b, s), v in xtab.items() if b == EXP_BUCKET)
+    n_exp_enrolled = sum(v for (b, s), v in xtab.items()
+                         if b == EXP_BUCKET and str(s).strip().lower() in cfg.npdb_active)
+    pct_exp = f"{round(100 * n_exp_enrolled / n_expected)}% of expected" if n_expected else ""
 
+    # fold the reverse-pass "extra" enrollments into the issue x NPDB-status counter + the detail rows
+    for r in extra_rows:
+        xtab_issue[("extra", (str(r[13]).split(";")[0].strip() or "Enrolled"))] += 1
+    # name,npi,dob,db_ids,entity,statuses, enroll_start, cancel_date, cancelled_by
+    cli_extra = [[r[6], r[7], r[8], r[5], r[12], r[13], r[14], r[15], r[16]] for r in extra_rows]
+    # name,npi,cred,issue,current,correct, enroll_start, cancel_date, cancelled_by
+    cli_databank = [[u[1], u[2], u[3], u[4], u[5], u[6], u[9], u[10], u[11]] for u in db_updates]
+
+    ISSUE_LABELS = {"missing": "Missing enrollments", "terminated": "Terminated still enrolled",
+                    "delegated": "Delegated still enrolled", "duplicates": "Duplicate enrollments",
+                    "extra": "Extra (not in our records)", "databank": "Databank ID mismatch",
+                    "identity": "Identity conflict"}
+    ISSUE_ORDER = ["missing", "terminated", "delegated", "duplicates", "extra", "databank", "identity"]
+    enabled_keys = [k for k in ISSUE_ORDER if k in cfg.client_issue_types]
+    issues_total = sum(v for (k, s), v in xtab_issue.items() if k in cfg.client_issue_types)
+
+    def _status_cols(counter, keyset=None):
+        items = [k for k in counter if (keyset is None or k[0] in keyset)]
+        cols = sorted({k[1] for k in items if k[1] != "No NPDB record"})
+        if any(k[1] == "No NPDB record" for k in items):
+            cols.append("No NPDB record")
+        return cols
+
+    exp_rows = sorted({k[0] for k in xtab_exp},
+                      key=lambda c: (-sum(v for kk, v in xtab_exp.items() if kk[0] == c), c))
+    exp_cols = _status_cols(xtab_exp)
+    iss_cols = _status_cols(xtab_issue, set(enabled_keys))
+    rows_with_data = [k for k in enabled_keys if any(kk[0] == k for kk in xtab_issue)]
+
+    # ---- client_summary: KPI cards + two breakdown matrices ----
     client_spec, client_summary = [], []
     def _c(style, *cells):
         client_spec.append(style); client_summary.append(list(cells))
-    _c("title",  "NPDB Enrollment — Client Summary")
-    _c("blank",  "")
-    _c("kpi",    "Providers reviewed", total, "")
-    _c("normal", "Expected to hold an active NPDB enrollment", n_expected, epct(n_expected))
-    _c(("good" if exp_attn == 0 else "normal"), "    correctly enrolled (exactly one active)", exp_ok, epct(exp_ok))
-    _c(("bad"  if exp_attn else "good"), "    need attention (missing or duplicate)", exp_attn, epct(exp_attn))
-    _c(("bad"  if action_total else "good"), "Items needing action (all categories)", action_total, pct(action_total))
-    _c("blank",  "")
-    _c("section", "Credentialing status vs NPDB enrollment status")
-    cl_mhdr = len(client_summary)
-    _c("colhdr", "Credentialing status", *OUT_COLS, "Total")
-    for cat in CRED_ROWS:
-        vals = [xtab[(cat, oc)] for oc in OUT_COLS]
-        _c("matrix", cat, *vals, sum(vals))
-    cl_mlast = len(client_summary) - 1
-    col_tot = [sum(xtab[(cat, oc)] for cat in CRED_ROWS) for oc in OUT_COLS]
-    _c("total", "Total", *col_tot, sum(col_tot))
-    _c("blank",  "")
-    _c("section", "Enrollment compliance — providers expected to be enrolled")
-    _c("colhdr", "Status", "Providers", "% of expected")
-    cl_pfirst = len(client_summary)
-    _c("good", "Correctly enrolled (one active)", exp_ok, epct(exp_ok))
-    _c("warn", "Missing enrollment", acct["EXP_MISSING"], epct(acct["EXP_MISSING"]))
-    _c("bad",  "Duplicate (more than one active)", acct["EXP_DUPLICATE"], epct(acct["EXP_DUPLICATE"]))
-    cl_plast = len(client_summary) - 1
-    client_layout = {"mhdr": cl_mhdr, "mlast": cl_mlast, "ncols": len(OUT_COLS),
-                     "pfirst": cl_pfirst, "plast": cl_plast}
+    _c("title", "NPDB Enrollment — Client Summary")
+    _c("blank", "")
+    _c("kpi", "Total providers", total, "")
+    _c("kpi", "Expected enrollments", n_expected, pct(n_expected))
+    _c("kpi", "Enrolled of expected", n_exp_enrolled, pct_exp)
+    _c("bad", "Total issues to resolve", issues_total, pct(issues_total))
+    _c("sub", "Expected = Active, Non-Delegated providers (credentialed or recredentialing, not delegated).", "", "")
+    _c("blank", "")
+    _c("section", "Expected enrollments — credentialing status vs NPDB status")
+    _c("colhdr", "Credentialing status", *exp_cols, "Total")
+    for cs_v in exp_rows:
+        vals = [xtab_exp[(cs_v, c)] for c in exp_cols]
+        _c("matrix", cs_v, *vals, sum(vals))
+    _c("total", "Total", *[sum(xtab_exp[(cs_v, c)] for cs_v in exp_rows) for c in exp_cols], sum(xtab_exp.values()))
+    _c("blank", "")
+    _c("section", "Issues to resolve — issue type vs NPDB status")
+    if rows_with_data:
+        _c("colhdr", "Issue type", *iss_cols, "Total")
+        for k in rows_with_data:
+            vals = [xtab_issue[(k, c)] for c in iss_cols]
+            _c("matrix", ISSUE_LABELS[k], *vals, sum(vals))
+        _c("total", "Total", *[sum(xtab_issue[(k, c)] for k in rows_with_data) for c in iss_cols], issues_total)
+    else:
+        _c("good", "No issues to resolve", "", "")
+    client_layout = {"plast": len(client_summary) - 1}
+
+    # ---- client_issues: per-issue detail page (clean provider tables, one section per issue) ----
+    DATES = ["Enrollment start", "Cancellation date", "Cancelled by"]
+    ISSUE_TABLES = {
+        "missing":    ("Missing enrollments — Active, Non-Delegated providers not enrolled",
+                       ["Provider", "NPI", "Credentialing status", "Credentialing cycle", "NPDB status",
+                        "Suggested databank ID"] + DATES, cli_missing),
+        "terminated": ("Terminated providers still actively enrolled",
+                       ["Provider", "NPI", "Credentialing status", "Credentialing cycle", "NPDB status",
+                        "Databank ID(s)", "Entity"] + DATES, cli_term),
+        "delegated":  ("Delegated providers still actively enrolled",
+                       ["Provider", "NPI", "Credentialing status", "Credentialing cycle", "NPDB status",
+                        "Databank ID(s)", "Entity"] + DATES, cli_deleg),
+        "duplicates": ("Duplicate enrollments — more than one active enrollment",
+                       ["Provider", "NPI", "Credentialing status", "Credentialing cycle", "Active enrollments",
+                        "Databank IDs", "Enrollment start (primary)"], cli_dup),
+        "extra":      ("Extra NPDB enrollments not in our records",
+                       ["Name", "NPI", "DOB", "Databank ID(s)", "Entity", "NPDB status"] + DATES, cli_extra),
+        "databank":   ("Databank ID mismatches",
+                       ["Provider", "NPI", "Credentialing status", "Issue", "Current databank ID",
+                        "Correct databank ID"] + DATES, cli_databank),
+        "identity":   ("Identity conflicts — why each was flagged",
+                       ["Provider (ours)", "NPI", "Credentialing status", "Credentialing cycle", "Why flagged",
+                        "Matched NPDB name"] + DATES, cli_identity),
+    }
+    issues_spec, client_issues = [], []
+    def _ci(style, *cells):
+        issues_spec.append(style); client_issues.append(list(cells))
+    _ci("title", "NPDB Enrollment — Issues (detail)")
+    _ci("blank", "")
+    for k in enabled_keys:
+        title_txt, hdr, rows = ISSUE_TABLES[k]
+        _ci("section", f"{title_txt}  ({len(rows)})")
+        if rows:
+            _ci("colhdr", *hdr)
+            for r in rows:
+                _ci("matrix", *r)
+        else:
+            _ci("good", "None — nothing to resolve here", "", "")
+        _ci("blank", "")
+    issues_layout = {"plast": len(client_issues) - 1}
 
     headers = {
-        "summary": None, "client_summary": None, "readme": None,
+        "summary": None, "client_summary": None, "client_issues": None, "readme": None,
         "reconciliation": ["providerId","provider_name","npi","credentialingStatus","credentialingCycle",
             "status_class","expectation","match_tier","match_score","match_confidence","identity_conflict",
             "npdb_rows_matched","active_enrollments","cancelled_enrollments","other_enrollments","npdb_statuses",
@@ -849,7 +969,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "append_providerId","append_firstName","append_lastName","append_middleName","append_npi",
             "append_dateOfBirth","append_ssn_last4","append_license","append_license_state"],
     }
-    data = {"summary": summary, "client_summary": client_summary,
+    data = {"summary": summary, "client_summary": client_summary, "client_issues": client_issues,
             "action_items_all": action_all, "missing_enrollment": missing_rows,
             "should_be_cancelled": cancel_rows, "duplicates": dups, "databank_updates": db_updates,
             "extra_enrollments": extra_rows, "reconciliation": out}
@@ -861,8 +981,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         meta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id).execute(), "meta")
         existing = {s["properties"]["title"] for s in meta["sheets"]}
         sheet_ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
-        order = ["readme","summary","client_summary","action_items_all","missing_enrollment","should_be_cancelled",
-                 "duplicates","databank_updates","extra_enrollments","reconciliation"]
+        order = ["readme","summary","client_summary","client_issues","action_items_all","missing_enrollment",
+                 "should_be_cancelled","duplicates","databank_updates","extra_enrollments","reconciliation"]
         # remove old TitleCase result tabs (renamed to snake_case)
         old_titlecase = {"README","Summary","Action_Items_All","Missing_Enrollment",
                          "Should_Be_Cancelled","Duplicates","Databank_Updates","Reconciliation"}
@@ -967,13 +1087,18 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             reqs += _client_summary_reqs(sheet_ids["client_summary"], client_spec, client_summary, client_layout)
             _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
                 body={"requests": reqs}).execute(), "format client summary")
+        if "client_issues" in sheet_ids:
+            progress("Formatting client issues tab…")
+            _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
+                body={"requests": _client_summary_reqs(sheet_ids["client_issues"], issues_spec, client_issues, issues_layout)}).execute(),
+                "format client issues")
 
-        # separate, clean client-facing spreadsheet (summary + trimmed recon), shared anyone-with-link
+        # separate, clean client-facing spreadsheet (summary + issues + recon), shared anyone-with-link
         if client_workbook:
             try:
                 cw_id, cw_url = export_client_workbook(
                     client_workbook_title or "NPDB Enrollment — Client Summary",
-                    client_summary, client_spec, client_layout,
+                    client_summary, client_spec, client_layout, issues_spec, client_issues, issues_layout,
                     CLIENT_RECON_HDR, client_recon, cfg, progress=progress)
                 progress(f"Client workbook: {cw_url}")
             except Exception as e:
@@ -1069,10 +1194,11 @@ def _summary_format_reqs(sid, spec):
     return reqs
 
 def export_client_workbook(title, client_summary, client_spec, client_layout,
+                           issues_spec, client_issues, issues_layout,
                            recon_header, recon_rows, cfg, share_anyone=True, progress=lambda m: None):
-    """Create a fresh, client-facing spreadsheet holding just the client_summary tab (with charts)
-    and a trimmed reconciliation page (split into _2, _3… past the row cap). Shares it
-    anyone-with-link (viewer) via Drive. Returns (spreadsheet_id, spreadsheet_url)."""
+    """Create a fresh, client-facing spreadsheet: client_summary (KPIs + breakdowns), client_issues
+    (per-issue detail tables), and a trimmed reconciliation page (split into _2, _3… past the row
+    cap). Shares it anyone-with-link (viewer) via Drive. Returns (spreadsheet_id, spreadsheet_url)."""
     svc = get_service(cfg.sa_key_path)
     progress("Creating client workbook…")
     ss = _retry(lambda: svc.spreadsheets().create(
@@ -1087,7 +1213,8 @@ def export_client_workbook(title, client_summary, client_spec, client_layout,
                     recon_rows[i:i+cap]) for i in range(0, len(recon_rows), cap)]
     else:
         rchunks = [("client_reconciliation", recon_rows)]
-    plan = [("client_summary", None, client_summary)] + [(t, recon_header, c) for t, c in rchunks]
+    plan = [("client_summary", None, client_summary),
+            ("client_issues", None, client_issues)] + [(t, recon_header, c) for t, c in rchunks]
 
     # rename the default sheet to the first tab, add the rest in one batch
     add_reqs = [{"updateSheetProperties": {"properties": {"sheetId": first_id, "title": plan[0][0]},
@@ -1117,6 +1244,9 @@ def export_client_workbook(title, client_summary, client_spec, client_layout,
     _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=new_id, body={"requests":
         _client_summary_reqs(sheet_ids["client_summary"], client_spec, client_summary, client_layout)}).execute(),
         "format client summary")
+    _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=new_id, body={"requests":
+        _client_summary_reqs(sheet_ids["client_issues"], issues_spec, client_issues, issues_layout)}).execute(),
+        "format client issues")
     recon_reqs = []
     for t, sid_t in sheet_ids.items():
         if t.startswith("client_reconciliation"):
@@ -1154,10 +1284,9 @@ def _recon_header_reqs(sid, ncols):
     ]
 
 def _client_summary_reqs(sid, spec, rows, lay):
-    """batchUpdate requests for the client_summary tab: band/color the KPI + cross-tab rows,
-    then embed a stacked column chart (credentialing status x enrollment outcome) and a pie
-    chart (enrollment compliance among expected providers). `lay` carries the row/col anchors
-    of the matrix and the pie data block so the chart source ranges are exact."""
+    """batchUpdate requests for the client_summary tab: band/color the KPI cards and the stacked
+    issue-type sections (header + table). Only the headline KPI rows get numeric formatting on the
+    value column — issue tables are left as-is so provider NPIs aren't reformatted as numbers."""
     def rgb(h):
         h = h.lstrip("#")
         return {"red": int(h[0:2],16)/255, "green": int(h[2:4],16)/255, "blue": int(h[4:6],16)/255}
@@ -1190,12 +1319,12 @@ def _client_summary_reqs(sid, spec, rows, lay):
     # widen the grid so the charts (anchored to the right of the table) have somewhere to live
     reqs = [
         {"updateSheetProperties": {"properties": {"sheetId": sid,
-            "gridProperties": {"rowCount": max(n, lay["plast"]) + 40, "columnCount": 24}},
+            "gridProperties": {"rowCount": max(n, lay.get("plast", 0)) + 6, "columnCount": max(NC, 3)}},
             "fields": "gridProperties(rowCount,columnCount)"}},
         {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-            "properties": {"pixelSize": 320}, "fields": "pixelSize"}},
+            "properties": {"pixelSize": 300}, "fields": "pixelSize"}},
         {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 1, "endIndex": NC},
-            "properties": {"pixelSize": 130}, "fields": "pixelSize"}},
+            "properties": {"pixelSize": 155}, "fields": "pixelSize"}},
         {"updateBorders": {"range": full, "top": {"style": "NONE"}, "bottom": {"style": "NONE"},
             "left": {"style": "NONE"}, "right": {"style": "NONE"},
             "innerHorizontal": {"style": "NONE"}, "innerVertical": {"style": "NONE"}}},
@@ -1205,12 +1334,15 @@ def _client_summary_reqs(sid, spec, rows, lay):
             "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1, "startColumnIndex": 0, "endColumnIndex": NC},
             "cell": {"userEnteredFormat": STYLE[style]},
             "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,verticalAlignment,textFormat)"}})
-    # numeric columns (everything right of the label): right-aligned, thousands separators
-    reqs.append({"repeatCell": {
-        "range": {"sheetId": sid, "startRowIndex": 1, "endRowIndex": n, "startColumnIndex": 1, "endColumnIndex": NC},
-        "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT",
-            "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}},
-        "fields": "userEnteredFormat(horizontalAlignment,numberFormat)"}})
+    # numeric formatting ONLY on the headline KPI value cells (col B) — never on the issue tables,
+    # whose col B holds NPIs that must not be reformatted as numbers.
+    for i, style in enumerate(spec):
+        if style in ("kpi", "bad"):
+            reqs.append({"repeatCell": {
+                "range": {"sheetId": sid, "startRowIndex": i, "endRowIndex": i + 1, "startColumnIndex": 1, "endColumnIndex": 2},
+                "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT",
+                    "numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}},
+                "fields": "userEnteredFormat(horizontalAlignment,numberFormat)"}})
     # title banner across all columns; outer box; freeze the banner
     reqs.append({"mergeCells": {"range": {"sheetId": sid, "startRowIndex": 0, "endRowIndex": 1,
         "startColumnIndex": 0, "endColumnIndex": NC}, "mergeType": "MERGE_ALL"}})
@@ -1221,35 +1353,7 @@ def _client_summary_reqs(sid, spec, rows, lay):
         "startColumnIndex": 0, "endColumnIndex": NC}, "bottom": {"style": "SOLID_THICK", "color": MIDBLUE}}})
     reqs.append({"updateSheetProperties": {"properties": {"sheetId": sid,
         "gridProperties": {"frozenRowCount": 1}}, "fields": "gridProperties.frozenRowCount"}})
-
-    # ---- charts ----
-    def src(col, r0, r1):
-        return {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r1,
-                "startColumnIndex": col, "endColumnIndex": col + 1}
-    mhdr, mlast = lay["mhdr"], lay["mlast"]      # header row + last matrix data row (Total row excluded)
-    anchor_col = NC + 1                          # park charts just right of the table
-    # stacked column: domain = credentialing-status labels, one series per enrollment outcome
-    reqs.append({"addChart": {"chart": {
-        "spec": {"title": "Credentialing status vs NPDB enrollment status",
-            "basicChart": {"chartType": "COLUMN", "stackedType": "STACKED",
-                "legendPosition": "BOTTOM_LEGEND", "headerCount": 1,
-                "axis": [{"position": "BOTTOM_AXIS", "title": "Credentialing status"},
-                         {"position": "LEFT_AXIS", "title": "Providers"}],
-                "domains": [{"domain": {"sourceRange": {"sources": [src(0, mhdr, mlast + 1)]}}}],
-                "series": [{"series": {"sourceRange": {"sources": [src(j, mhdr, mlast + 1)]}},
-                            "targetAxis": "LEFT_AXIS"} for j in range(1, lay["ncols"] + 1)]}},
-        "position": {"overlayPosition": {
-            "anchorCell": {"sheetId": sid, "rowIndex": mhdr, "columnIndex": anchor_col},
-            "offsetXPixels": 10, "widthPixels": 660, "heightPixels": 360}}}}})
-    # pie: enrollment compliance among providers expected to be enrolled
-    reqs.append({"addChart": {"chart": {
-        "spec": {"title": "Expected providers — enrollment compliance",
-            "pieChart": {"legendPosition": "RIGHT_LEGEND", "pieHole": 0.4,
-                "domain": {"sourceRange": {"sources": [src(0, lay["pfirst"], lay["plast"] + 1)]}},
-                "series": {"sourceRange": {"sources": [src(1, lay["pfirst"], lay["plast"] + 1)]}}}},
-        "position": {"overlayPosition": {
-            "anchorCell": {"sheetId": sid, "rowIndex": mhdr + 19, "columnIndex": anchor_col},
-            "offsetXPixels": 10, "widthPixels": 520, "heightPixels": 320}}}}})
+    # (Native charts intentionally omitted — the client summary is the banded tables only.)
     return reqs
 
 def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False):
@@ -1271,8 +1375,8 @@ def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False):
         "  Each provider is matched to their NPDB record on multiple identity fields (see Methodology).",
         "",
         "RESULT TABS",
-        "  client_summary       Client-facing overview: plain-language KPIs plus charts of credentialing",
-        "                       status vs NPDB enrollment status, and enrollment compliance.",
+        "  client_summary       Client-facing overview: provider buckets (delegation x active/terminated)",
+        "                       vs NPDB enrollment status. No internal action items.",
         "  summary              Headline figures and the actions required.",
         "  missing_enrollment   Should be enrolled but is not (or not active) — we enroll the provider.",
         "  duplicates           More than one active enrollment — we cancel the extras, keeping the oldest.",
