@@ -521,10 +521,25 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             if "gender_mismatch" in bb:
                 reasons.append(f"gender differs (ours {pi['gender']} vs NPDB {best['gender']})")
             conflict = "; ".join(reasons)
-        # Full matched set = every anchored, above-threshold row (blank-NPI enrollments included),
-        # so n_enr/n_can and the MISSING/DUPLICATE/SHOULD_BE_CANCELLED flags count all of a
-        # provider's real enrollments — not only the rows that happen to carry an NPI.
-        idxs = [i for _, i, _, _ in scored]
+        # Group all of THIS PERSON's enrollment rows for the active/cancelled counts: the
+        # NPI-bearing rows AND the blank-NPI "No License" rows NPDB writes — while rejecting
+        # look-alikes that merely share a weak signal. SSN last-4 is only 4 digits, so
+        # collisions are common at scale (e.g. Irine Chacko shares *1034 with Andrea Richard);
+        # ssn4 + same gender + a weak fuzzy name can clear accept_score on its own. So: a
+        # DIFFERENT non-blank NPI means a different person (decisive), and a blank-NPI row must
+        # corroborate on >=2 identity signals (ssn4 / dob / full-name / license), not one alone.
+        # (Was by_npi[best] — dropped blank-NPI rows; then all-scored — pulled in SSN-4 collisions.)
+        licnums = {x[0] for x in pi["lic"] if x[0]}
+        def _same_person(m):
+            if pi["npi"] and m["npi"]:
+                return pi["npi"] == m["npi"]          # both carry an NPI -> decisive
+            sig = ((1 if pi["ssn4"] and pi["ssn4"] == m["ssn4"] else 0)
+                   + (1 if pi["dob"] and pi["dob"] == m["dob"] else 0)
+                   + (1 if _ratio(pi["last"], m["last"]) >= cfg.name_threshold
+                          and _ratio(pi["first"], m["first"]) >= cfg.name_threshold else 0)
+                   + (1 if m["licnum"] and m["licnum"] in licnums else 0))
+            return sig >= 2
+        idxs = sorted({i for i in cand if i == bi or _same_person(npdb[i])})
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
