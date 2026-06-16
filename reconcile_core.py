@@ -493,12 +493,21 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         for lnum, _st in pi["lic"]:
             if lnum: cand |= set(by_licnum.get(lnum, []))
         if not cand and pi["dob"]: cand |= set(by_dob.get(pi["dob"], []))
-        bs, best, bi, bb, bln = -1, None, None, [], 0
+        # A provider's enrollments span MULTIPLE NPDB rows — re-enrollments, and the
+        # "No License" rows NPDB writes with a BLANK NPI. Keep EVERY candidate that clears
+        # accept_score with a real identity anchor, not just the ones sharing an NPI: the old
+        # code rebuilt the set from by_npi alone (see idxs below), which silently dropped a
+        # provider's blank-NPI enrollments — including active ones — and fabricated MISSING.
+        scored = []
         for i in cand:
             s, b, ln = _score(pi, npdb[i])
-            if _anchored(b, ln) and s > bs: bs, best, bi, bb, bln = s, npdb[i], i, b, ln
-        if best is None or bs < cfg.accept_score:
+            if _anchored(b, ln) and s >= cfg.accept_score:
+                scored.append((s, i, b, ln))
+        if not scored:
             return [], "", 0, "UNMATCHED", ""
+        scored.sort(key=lambda t: t[0], reverse=True)
+        bs, bi, bb, bln = scored[0]
+        best = npdb[bi]
         conf = _confidence(bb)
         # identity conflict — the NPI matched but a core identity field disagrees. Describe WHICH
         # field(s) and the conflicting values, so a reviewer can see exactly why it was flagged.
@@ -512,7 +521,10 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             if "gender_mismatch" in bb:
                 reasons.append(f"gender differs (ours {pi['gender']} vs NPDB {best['gender']})")
             conflict = "; ".join(reasons)
-        idxs = by_npi.get(best["npi"], []) if best["npi"] else [bi]
+        # Full matched set = every anchored, above-threshold row (blank-NPI enrollments included),
+        # so n_enr/n_can and the MISSING/DUPLICATE/SHOULD_BE_CANCELLED flags count all of a
+        # provider's real enrollments — not only the rows that happen to carry an NPI.
+        idxs = [i for _, i, _, _ in scored]
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
