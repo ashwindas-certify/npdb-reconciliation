@@ -677,7 +677,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             if n_enr == 0:
                 xtab_issue[("missing", npdb_label)] += 1
                 cli_missing.append([pname, npi, cs, cyc_raw, (statuses or "No NPDB record"),
-                                    (sot_db or suggested_db or ""), p_start, p_cancel, p_cancelby])
+                                    ids_str, p_start, p_cancel, p_cancelby])
             elif n_enr > 1:
                 xtab_issue[("duplicates", npdb_label)] += 1
                 cli_dup.append([pname, npi, cs, cyc_raw, n_enr, ids_str, p_start])
@@ -936,7 +936,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     ISSUE_TABLES = {
         "missing":    ("Missing enrollments — Active, Non-Delegated providers not enrolled",
                        ["Provider", "NPI", "Credentialing status", "Credentialing cycle", "NPDB status",
-                        "Suggested databank ID"] + DATES, cli_missing),
+                        "Databank ID(s)"] + DATES, cli_missing),
         "terminated": ("Terminated providers still actively enrolled",
                        ["Provider", "NPI", "Credentialing status", "Credentialing cycle", "NPDB status",
                         "Databank ID(s)", "Entity"] + DATES, cli_term),
