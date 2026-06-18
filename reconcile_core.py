@@ -68,7 +68,10 @@ SELECT
     COALESCE(JSON_VALUE(caqh.practitioner_information, '$.homeAddress.state'), ''), ' ',
     COALESCE(JSON_VALUE(caqh.practitioner_information, '$.homeAddress.zipCode'), '')
   ) AS home_full_address,
-  e.businessPurpose_isForCredentialing
+  e.businessPurpose_isForCredentialing,
+  e.credentialingWorkflowTimeline_credentialingDecisionDate,
+  e.credentialingWorkflowTimeline_lastCredentialedDate,
+  e.credentialingStatusUpdatedAt
 FROM `certifyos-production-platform.appdb_data.edit_providers` e
 LEFT JOIN npdb ON npdb.edit_provider_id = e.edit_provider_id
 LEFT JOIN caqh ON caqh.edit_provider_id = e.edit_provider_id
@@ -95,6 +98,22 @@ class Config:
     terminated_statuses: set = field(default_factory=lambda: {"provider terminated","withdrawn/cancelled","cred denied"})
     recred_cycles: set       = field(default_factory=lambda: {"recredentialing"})  # also expect active enrollment
     npdb_active: set         = field(default_factory=lambda: {"enrolled"})
+    # ---- expectation model: when we EXPECT an active NPDB enrollment (lowercased status match) ----
+    #   recred  = has a credentialing decision date or last-credentialed date (already credentialed before)
+    #   initial = neither date present
+    #   delegated (businessPurpose_isForCredentialing=false) -> never expected
+    expect_initial_statuses: set = field(default_factory=lambda: {
+        "cred approved", "psv complete by certifyos", "psv ready"})
+    # recred providers (already enrolled) ALSO expect during these in-flight statuses
+    expect_recred_extra: set = field(default_factory=lambda: {
+        "in progress", "data missing", "outreach in progress"})
+    # these expect ONLY if the status was updated within expect_recent_days
+    expect_recent_statuses: set = field(default_factory=lambda: {"hold for cred comm", "tabled"})
+    expect_recent_days: int = 90
+    # terminated/cancelled -> never expected; FLAG should-cancel if still active (no recency gate).
+    cancel_statuses: set = field(default_factory=lambda: {"provider terminated", "withdrawn/cancelled"})
+    # these cancel ONLY if still active AND last updated > expect_recent_days ago; a recent one = no harm.
+    cancel_if_stale_statuses: set = field(default_factory=lambda: {"cred denied"})
     npdb_cancelled: set      = field(default_factory=lambda: {"canceled","cancelled"})
     accept_score: float      = 45.0
     name_threshold: int      = 85          # fuzz ratio to count a name as corroborating
@@ -423,6 +442,20 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         if s in ("false","no","n","0","f","none","n/a","delegated"): return False
         return None
 
+    def _has_date(*vals):
+        """True if ANY value is a present (non-blank) date/timestamp."""
+        for v in vals:
+            if v is None: continue
+            s = str(v).strip().lower()
+            if s and s not in ("none", "nat", "null"): return True
+        return False
+
+    def _recent(v, days):
+        """True if timestamp v is within the last `days` days."""
+        ts = pd.to_datetime(v, errors="coerce", utc=True)
+        if pd.isna(ts): return False
+        return ts >= (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days))
+
     providers, prov_lic = {}, defaultdict(set)
     for r in sot_raw:
         pid = str(r.get("providerId","")).strip()
@@ -555,8 +588,9 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     matched_any = set()        # NPDB row indices claimed by some SOT provider (for the reverse pass)
     ACTIONABLE = {"MISSING_ENROLLMENT","DUPLICATE_ENROLLMENT","SHOULD_BE_CANCELLED","DATABANK_ID_OUT_OF_SYNC"}
     # plain-language labels for the client reconciliation page
-    EXPECT_FRIENDLY = {"expects_active": "Yes", "terminated": "No — terminated",
-                       "delegated": "No — delegated", "in_progress": "Pending"}
+    EXPECT_FRIENDLY = {"expects_active": "Yes", "delegated": "No — delegated",
+                       "not_evaluated": "Not evaluated", "terminated": "No — terminated",
+                       "in_progress": "Pending"}
     ACTION_FRIENDLY = {"MISSING_ENROLLMENT": "Enroll provider in NPDB",
                        "DUPLICATE_ENROLLMENT": "Cancel duplicate enrollments (keep oldest)",
                        "SHOULD_BE_CANCELLED": "Cancel active NPDB enrollment",
@@ -596,15 +630,27 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         # businessPurpose_isForCredentialing (when present) overrides: false = delegated provider
         # (no active enrollment wanted); true keeps the status-based expectation.
         cyc = str(p.get("credentialingCycle", "")).strip().lower()
+        status = str(p.get("credentialingStatus", "")).strip().lower()
         fc = for_cred(p)
-        if cls == "terminated":
-            expect = "terminated"
-        elif fc is False:
-            expect = "delegated"
-        elif cls == "active" or cyc in cfg.recred_cycles:
-            expect = "expects_active"
+        # recred = a prior credentialing decision exists (decision date OR last-credentialed date present)
+        is_recred = _has_date(p.get("credentialingWorkflowTimeline_credentialingDecisionDate"),
+                              p.get("credentialingWorkflowTimeline_lastCredentialedDate"))
+        recent = _recent(p.get("credentialingStatusUpdatedAt"), cfg.expect_recent_days)
+        if fc is False:
+            expect = "delegated"                          # delegated -> never expected; flag should-cancel if active
+        elif status in cfg.cancel_statuses:
+            expect = "terminated"                         # terminated/cancelled -> not expected; flag should-cancel if active
+        elif status in cfg.cancel_if_stale_statuses:
+            # e.g. cred denied: cancel if active AND stale (>90d); recently denied = no harm
+            expect = "terminated" if (_has_date(p.get("credentialingStatusUpdatedAt")) and not recent) else "not_evaluated"
         else:
-            expect = "in_progress"
+            ok = set(cfg.expect_initial_statuses)
+            if is_recred:
+                ok |= cfg.expect_recred_extra             # recred also expects during in-flight statuses
+            if recent:
+                ok |= cfg.expect_recent_statuses          # Hold for Cred Comm / Tabled only if recently updated
+            # stale hold/tabled, not-started, blank, etc. -> not_evaluated (no flag, no harm)
+            expect = "expects_active" if status in ok else "not_evaluated"
 
         if expect == "expects_active":
             bucket = "EXP_MISSING" if n_enr == 0 else ("EXP_DUPLICATE" if n_enr > 1 else "EXP_OK")
@@ -613,7 +659,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         elif expect == "delegated":
             bucket = "DELEG_SHOULD_CANCEL" if n_enr >= 1 else "DELEG_OK"
         else:
-            bucket = "IN_PROGRESS"
+            bucket = "IN_PROGRESS"   # not_evaluated (cred denied, stale hold/tabled, not-started, etc.) — no action
         acct[bucket] += 1; confc[conf] += 1
 
         # enrollment outcome — used by the client reconciliation 'result' column
@@ -650,7 +696,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         if conflict:
             flags.append("REVIEW_IDENTITY"); n_conflict += 1
         if not flags:
-            flags.append("IN_PROGRESS" if cls == "in_progress" else "OK")
+            flags.append("IN_PROGRESS" if expect == "not_evaluated" else "OK")
         for f in flags: counts[f] += 1
 
         npi = npi_n(p.get("npi")); cs = str(p.get("credentialingStatus",""))
