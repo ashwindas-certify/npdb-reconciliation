@@ -33,6 +33,26 @@ Web UI (Streamlit) + reusable core + CLI.
   `suggested_providerId`) when a provider is found at ≥ `link_confidence`, else `ADD_TO_SOT` with a
   ready-to-append SOT row in the `append_*` columns.
 
+## When do we expect an active NPDB enrollment?
+
+Per provider, the reconcile first decides whether an active enrollment is *expected* — that's what
+becomes **Missing / Duplicate / Should-cancel**. The rule (first match wins):
+
+| Provider is… | Expect active? | If found active |
+|---|---|---|
+| **Delegated** (`businessPurpose_isForCredentialing = false`) | No | **Cancel** |
+| **Provider Terminated / Withdrawn-Cancelled** | No | **Cancel** |
+| **Cred denied**, last updated **> 90 days** ago | No | **Cancel** |
+| **Cred denied**, updated **≤ 90 days** (or no date) | No | No flag (no harm) |
+| **Recred** (credentialing decision date *or* last-credentialed date present) + status ∈ {Cred approved, PSV complete by CertifyOS, PSV ready, In Progress, Data missing, Outreach in progress} **or** {Hold for Cred Comm, Tabled} updated ≤ 90 days | **Yes — exactly one** | OK · Duplicate if >1 · **Missing** if 0 |
+| **Initial** (neither date) + status ∈ {Cred approved, PSV complete by CertifyOS, PSV ready} **or** {Hold for Cred Comm, Tabled} updated ≤ 90 days | **Yes — exactly one** | OK · Duplicate · **Missing** |
+| **Stale Hold/Tabled (> 90 days), Not Started, blank, anything else** | No | No flag (not evaluated) |
+
+- **Recred vs Initial** is decided by **dates** (a prior credentialing decision exists), not the cycle text. Recred providers were already enrolled, so they still expect during in-flight statuses; initial providers don't until PSV-ready/complete/approved.
+- **"Active"** on the NPDB side = `npdb_enrollment_status = Enrolled`, matched to the provider by identity.
+- The "updated ≤ 90 days" recency uses `credentialingStatusUpdatedAt`.
+- All status sets + the window are tunable in `Config`: `expect_initial_statuses`, `expect_recred_extra`, `expect_recent_statuses`, `expect_recent_days`, `cancel_statuses`, `cancel_if_stale_statuses`.
+
 ## Run locally
 ```bash
 pip install -r requirements.txt
