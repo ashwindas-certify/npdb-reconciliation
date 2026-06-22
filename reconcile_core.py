@@ -39,7 +39,6 @@ WITH state_licenses AS (
   JOIN `certifyos-production-platform.appdb_data.edit_providers_state_licenses` sl
     ON sl.edit_provider_id = e.edit_provider_id
   WHERE sl.state IS NOT NULL AND sl.license_number IS NOT NULL
-    AND sl.state IN UNNEST(SPLIT(COALESCE(e.assignedStates, ''), ', '))
   GROUP BY e.edit_provider_id
 ),
 npdb AS (
@@ -143,6 +142,11 @@ class Config:
                                            #   SELECT * FROM `proj.ds.sot` WHERE organization = @client
     bq_clients_sql: str | None = None      # dropdown list, e.g.
                                            #   SELECT DISTINCT name FROM `proj.ds.organization_table` ORDER BY 1
+    # Network-to-entity map for multi-entity clients (e.g. University of Utah).
+    # {keyword: npdb_entity_name} — keyword matched case-insensitively against the provider's
+    # `affiliated_groups` cell. When set, a per-network enrollment check runs alongside the
+    # standard reconcile, writing results to the `network_missing_enrollment` tab.
+    affiliated_group_entity_map: dict = field(default_factory=dict)
 
 @dataclass
 class Result:
@@ -190,8 +194,14 @@ def bq_rows(sql: str, params: dict | None = None, project: str | None = None, pr
     client = bigquery.Client(project=project) if project else bigquery.Client()
     job_cfg = None
     if params:
-        job_cfg = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ScalarQueryParameter(k, "STRING", v) for k, v in params.items()])
+        bq_params = []
+        for k, v in params.items():
+            if isinstance(v, (list, tuple)):
+                # Coerce each element to str so mixed types never silently become a scalar
+                bq_params.append(bigquery.ArrayQueryParameter(k, "STRING", [str(x) for x in v]))
+            else:
+                bq_params.append(bigquery.ScalarQueryParameter(k, "STRING", v))
+        job_cfg = bigquery.QueryJobConfig(query_parameters=bq_params)
     # NULL -> "" so BigQuery rows behave like (empty) sheet cells for the normalizers
     out = []
     for r in client.query(sql, job_config=job_cfg).result(page_size=50000):
@@ -211,6 +221,28 @@ def bq_sot(client: str, cfg: "Config", progress=None):
     sql = cfg.bq_sot_sql or SOT_SQL
     return bq_rows(sql, {"client": client}, project=cfg.bq_project or DEFAULT_BQ_PROJECT, progress=progress)
 
+# Maps each Certify client to its NPDB entity name(s) via vw_org_configurations.
+ORG_ENTITY_MAP_SQL = """
+SELECT o.name AS client_name, vc.npdb_entity_name
+FROM `certifyos-production-platform.misc_reporting.vw_org_configurations` vc
+JOIN `certifyos-production-platform.appdb_data.organizations` o
+  ON o.document_id = vc.org_id
+WHERE vc.npdb_entity_name IS NOT NULL AND vc.npdb_entity_name != ''
+ORDER BY o.name, vc.npdb_entity_name
+"""
+
+def bq_entity_map(project: str | None = None) -> dict:
+    """Returns {client_name: [npdb_entity_name, ...]} from vw_org_configurations.
+    A client with multiple rows is a multi-decision client."""
+    rows = bq_rows(ORG_ENTITY_MAP_SQL, project=project or DEFAULT_BQ_PROJECT)
+    result: dict = {}
+    for r in rows:
+        name = r.get("client_name", "")
+        entity = r.get("npdb_entity_name", "")
+        if name and entity:
+            result.setdefault(name, []).append(entity)
+    return result
+
 def _retry(fn, what=""):
     for a in range(5):
         try: return fn()
@@ -225,7 +257,7 @@ def list_tabs(svc, sheet_id):
 # canonical sheet-style NPDB headers the parser expects
 _NPDB_CANON = ["Data Bank Subject ID Number","NPI","SSN","Birthdate","First Name","Last Name",
                "Middle Name","License","NPDB Enrollment Status","Submitted on Behalf of Entity",
-               "Enrollment Start Date","Cancellation Date","Cancelled By","Sex"]
+               "Enrollment Start Date","Cancellation Date","Canceller Name","Submitter Name","Sex"]
 _NPDB_ALIAS = {"databanksubjectid": "Data Bank Subject ID Number",
                "databankid": "Data Bank Subject ID Number",
                "subjectid": "Data Bank Subject ID Number",
@@ -233,9 +265,19 @@ _NPDB_ALIAS = {"databanksubjectid": "Data Bank Subject ID Number",
                "enrollmentstatus": "NPDB Enrollment Status",
                "entity": "Submitted on Behalf of Entity",
                "canceldate": "Cancellation Date",
-               "canceledby": "Cancelled By",
-               "cancellationby": "Cancelled By",
-               "cancellationuser": "Cancelled By",
+               # Canceller Name — actual NPDB CSV column name (BQ: canceller_name → cancellername)
+               "cancellername": "Canceller Name",
+               "cancelledby": "Canceller Name",
+               "canceledby": "Canceller Name",
+               "cancellationby": "Canceller Name",
+               "cancellationuser": "Canceller Name",
+               "cancelbyuser": "Canceller Name",
+               # Submitter Name — actual NPDB CSV column name (BQ: submitter_name → submittername)
+               "submittername": "Submitter Name",
+               "enrolledby": "Submitter Name",
+               "submittedby": "Submitter Name",
+               "submitby": "Submitter Name",
+               "enrollby": "Submitter Name",
                "gender": "Sex"}
 
 def normalize_npdb_keys(rows):
@@ -373,10 +415,16 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     npdb_keys = list(npdb_raw[0].keys()) if npdb_raw else []
     npdb_gender_key = cfg.npdb_gender_field or _detect_col(
         npdb_keys, exacts=("sex","gender","subject sex","subject gender"), contains_any=("gender","sex"))
-    # who cancelled the enrollment (only some NPDB reports carry it)
+    # Actual NPDB CSV column = "Canceller Name" (BQ: canceller_name)
     npdb_cancelby_key = _detect_col(
-        npdb_keys, exacts=("cancelled by","canceled by","cancelled_by","canceled_by","cancellation by"),
-        contains_all=("cancel",), contains_any=("by","user","who"), avoid=("date",))
+        npdb_keys, exacts=("canceller name","canceller_name","cancellername",
+                           "cancelled by","canceled by","cancellation by"),
+        contains_all=("cancel",), contains_any=("name","by","user","who"), avoid=("date","id"))
+    # Actual NPDB CSV column = "Submitter Name" (BQ: submitter_name)
+    npdb_enrolledby_key = _detect_col(
+        npdb_keys, exacts=("submitter name","submitter_name","submittername",
+                           "enrolled by","submitted by"),
+        contains_any=("submit","enroll"), avoid=("status","start","date","entity","behalf","id"))
     by_npi, by_ssn4, by_dob_last, by_dob, by_licnum = (defaultdict(list), defaultdict(list),
                                                        defaultdict(list), defaultdict(list), defaultdict(list))
     for r in npdb_raw:
@@ -393,6 +441,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                "enroll_start": str(r.get("Enrollment Start Date","")).strip(),
                "cancel_date": str(r.get("Cancellation Date","")).strip(),
                "cancelled_by": str(r.get(npdb_cancelby_key,"")).strip() if npdb_cancelby_key else "",
+               "enrolled_by": str(r.get(npdb_enrolledby_key,"")).strip() if npdb_enrolledby_key else "",
                "raw_first": str(r.get("First Name","")).strip(), "raw_last": str(r.get("Last Name","")).strip(),
                "raw_middle": str(r.get("Middle Name","")).strip()}
         i = len(npdb); npdb.append(rec)
@@ -576,6 +625,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
+    network_missing_rows = []   # per-network enrollment gaps (populated when affiliated_group_entity_map is set)
+    network_ok_counts    = Counter()   # network_kw → providers correctly enrolled under that entity
     client_recon = []          # trimmed, plain-language reconciliation for the client workbook
     # client_summary breakdowns (counts only): expected providers by credentialingStatus x NPDB
     # status, and issues by issue-type x NPDB status. (extra issues are folded in after the loop.)
@@ -599,13 +650,33 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                         "npdb_enrollment_status", "active_enrollments", "result", "action_needed", "npdb_databank_id"]
     # NPDB data points each row was compared against (matched record)
     NPDB_HDR  = ["npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_databank_id","npdb_enroll_status",
-                 "npdb_entity","npdb_enroll_start","npdb_cancel_date","npdb_cancelled_by"]
+                 "npdb_entity","npdb_enroll_start","npdb_cancel_date","npdb_canceller_name","npdb_submitter_name"]
     NPDB3_HDR = ["npdb_name","npdb_npi","npdb_dob"]
-    def npdb_pts(m):
+
+    def _agg(recs, key):
+        """Comma-separated non-blank unique values for `key` across all records."""
+        return ", ".join(sorted({str(r[key]) for r in recs if r.get(key)}))
+
+    def npdb_pts(m, all_matched=None):
+        """NPDB columns for one provider. `all_matched` aggregates multi-value fields
+        (databank ids, statuses, entities, dates, canceller, submitter) across every
+        matched record so no cell is left blank when prim alone is empty."""
         if not m: return [""] * len(NPDB_HDR)
-        return [f"{m['raw_last']}, {m['raw_first']}".strip(", "), m["npi"], m["dob"], m["ssn4"],
-                m["databank_id"], m["enroll_status"], m["entity"],
-                m["enroll_start"], m["cancel_date"], m["cancelled_by"]]
+        recs = all_matched or [m]
+        name = f"{m['raw_last']}, {m['raw_first']}".strip(", ")
+        return [
+            name,
+            _agg(recs, "npi")          or m["npi"],
+            _agg(recs, "dob")          or m["dob"],
+            _agg(recs, "ssn4")         or m["ssn4"],
+            _agg(recs, "databank_id")  or m["databank_id"],
+            _agg(recs, "enroll_status") or m["enroll_status"],
+            _agg(recs, "entity")       or m["entity"],
+            _agg(recs, "enroll_start") or m["enroll_start"],
+            _agg(recs, "cancel_date")  or m["cancel_date"],
+            _agg(recs, "cancelled_by") or m["cancelled_by"],
+            _agg(recs, "enrolled_by")  or m["enrolled_by"],
+        ]
     def npdb3(m):
         return [f"{m['raw_last']}, {m['raw_first']}".strip(", "), m["npi"], m["dob"]] if m else ["","",""]
     def _start_ts(m):
@@ -633,6 +704,14 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         prim = next((m for m in matched if m["enroll_class"] == "active"), matched[0] if matched else None)
         n_enr = sum(1 for m in matched if m["enroll_class"] == "active")
         n_can = sum(1 for m in matched if m["enroll_class"] == "cancelled")
+        # For multi-entity clients (e.g. Utah) one active enrollment per entity is correct —
+        # a true duplicate is 2+ active under the SAME entity.
+        if cfg.affiliated_group_entity_map:
+            _enr_per_entity = Counter(
+                m["entity"].strip().lower() for m in matched if m["enroll_class"] == "active")
+            _is_dup = any(v > 1 for v in _enr_per_entity.values())
+        else:
+            _is_dup = n_enr > 1
         n_oth = sum(1 for m in matched if m["enroll_class"] == "other")
         npdb_ids = sorted({m["databank_id"] for m in matched if m["databank_id"]})
         sot_db = str(p.get("databank_subject_id","")).strip()
@@ -665,7 +744,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             expect = "expects_active" if status in ok else "not_evaluated"
 
         if expect == "expects_active":
-            bucket = "EXP_MISSING" if n_enr == 0 else ("EXP_DUPLICATE" if n_enr > 1 else "EXP_OK")
+            bucket = "EXP_MISSING" if n_enr == 0 else ("EXP_DUPLICATE" if _is_dup else "EXP_OK")
         elif expect == "terminated":
             bucket = "TERM_SHOULD_CANCEL" if n_enr >= 1 else "TERM_OK"
         elif expect == "delegated":
@@ -696,7 +775,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         flags = []
         if expect == "expects_active":
             if n_enr == 0:  flags.append("MISSING_ENROLLMENT")
-            elif n_enr > 1: flags.append("DUPLICATE_ENROLLMENT")
+            elif _is_dup:   flags.append("DUPLICATE_ENROLLMENT")
         elif expect in ("terminated", "delegated") and n_enr >= 1:
             flags.append("SHOULD_BE_CANCELLED")
         if not matched: flags.append("NO_NPDB_MATCH")
@@ -717,7 +796,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         out.append([pid, pname, npi, cs, cyc_raw, cls, expect, tier, score, conf, conflict, len(matched),
                     n_enr, n_can, n_oth, statuses, sot_db, ", ".join(npdb_ids),
                     ("Y" if (sot_db and sot_db in npdb_ids) else ("N" if matched else "")),
-                    suggested_db, " | ".join(flags), *npdb_pts(prim)])
+                    suggested_db, " | ".join(flags), *npdb_pts(prim, matched)])
         # trimmed, plain-language row for the client workbook
         acts_friendly = [ACTION_FRIENDLY[f] for f in flags if f in ACTION_FRIENDLY]
         action_txt = "; ".join(acts_friendly) if acts_friendly else \
@@ -726,17 +805,18 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                              statuses or "(none)", n_enr, outcome, action_txt, ", ".join(npdb_ids)])
         # client_summary breakdowns + client_issues tables (`delegation`/`npdb_label` set above).
         # Expected = Active, Non-Delegated (credentialed/recredentialing, not delegated) -> should be enrolled.
-        ids_str = ", ".join(npdb_ids); entity_str = prim["entity"] if prim else ""
-        p_start = prim["enroll_start"] if prim else ""        # enrollment dates from the matched record
-        p_cancel = prim["cancel_date"] if prim else ""
-        p_cancelby = prim["cancelled_by"] if prim else ""
+        ids_str = ", ".join(npdb_ids); entity_str = _agg(matched, "entity") if matched else ""
+        p_start    = _agg(matched, "enroll_start") if matched else ""
+        p_cancel   = _agg(matched, "cancel_date")  if matched else ""
+        p_cancelby = _agg(matched, "cancelled_by") if matched else ""
+        p_enrolledby = _agg(matched, "enrolled_by") if matched else ""
         if delegation == "Non-Delegated" and expect == "expects_active":
             xtab_exp[(cs.strip() or "(blank)", npdb_label)] += 1
             if n_enr == 0:
                 xtab_issue[("missing", npdb_label)] += 1
                 cli_missing.append([pname, npi, cs, cyc_raw, (statuses or "No NPDB record"),
                                     ids_str, p_start, p_cancel, p_cancelby])
-            elif n_enr > 1:
+            elif _is_dup:
                 xtab_issue[("duplicates", npdb_label)] += 1
                 cli_dup.append([pname, npi, cs, cyc_raw, n_enr, ids_str, p_start])
         if expect == "terminated" and n_enr >= 1:
@@ -755,29 +835,91 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             xtab_issue[("databank", npdb_label)] += 1
         if "DUPLICATE_ENROLLMENT" in flags:
             active_ms = sorted([m for m in matched if m["enroll_class"] == "active"], key=_start_ts)
-            for j, m in enumerate(active_ms):   # oldest first -> retain it (max history)
-                retain = "KEEP (oldest / max history)" if j == 0 else "cancel"
-                dups.append([pid, pname, npi, cs, retain, m["databank_id"], m["enroll_status"],
-                             m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"], *npdb3(m)])
+            if cfg.affiliated_group_entity_map:
+                # Group by entity — only flag rows where the same entity appears 2+ times
+                from itertools import groupby as _gb
+                _grouped = {ek: list(eg) for ek, eg in
+                            _gb(sorted(active_ms, key=lambda m: m["entity"].strip().lower()),
+                                key=lambda m: m["entity"].strip().lower())}
+                for _ems in _grouped.values():
+                    if len(_ems) < 2:
+                        continue  # single enrollment under this entity — not a duplicate
+                    for j, m in enumerate(_ems):  # oldest first = retain
+                        retain = "KEEP (oldest / max history)" if j == 0 else "cancel"
+                        dups.append([pid, pname, npi, cs, tier, score, conf, retain,
+                                     m["databank_id"], m["enroll_status"],
+                                     m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"],
+                                     m["enrolled_by"], *npdb3(m)])
+            else:
+                for j, m in enumerate(active_ms):   # oldest first -> retain it (max history)
+                    retain = "KEEP (oldest / max history)" if j == 0 else "cancel"
+                    dups.append([pid, pname, npi, cs, tier, score, conf, retain,
+                                 m["databank_id"], m["enroll_status"],
+                                 m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"],
+                                 m["enrolled_by"], *npdb3(m)])
         if "DATABANK_ID_OUT_OF_SYNC" in flags:
-            db_updates.append([pid, pname, npi, cs, ("missing" if not sot_db else "mismatch"),
+            db_updates.append([pid, pname, npi, cs, tier, score, conf,
+                               ("missing" if not sot_db else "mismatch"),
                                sot_db, suggested_db, statuses,
                                next((m["entity"] for m in matched if m["databank_id"] == suggested_db), ""),
                                (prim["enroll_start"] if prim else ""), (prim["cancel_date"] if prim else ""),
-                               (prim["cancelled_by"] if prim else ""), *npdb3(prim)])
+                               (prim["cancelled_by"] if prim else ""), (prim["enrolled_by"] if prim else ""),
+                               *npdb3(prim)])
         if "MISSING_ENROLLMENT" in flags:
             missing_rows.append([pid, pname, npi, cs,
                                  ("NO_NPDB_RECORD" if not matched else "ENROLLMENT_NOT_ACTIVE"),
-                                 statuses or "(none)", sot_db, ", ".join(npdb_ids), tier, score, *npdb_pts(prim)])
+                                 statuses or "(none)", sot_db, ", ".join(npdb_ids), tier, score, conf, *npdb_pts(prim, matched)])
+
+        # ---- Network-level enrollment check (multi-entity clients, e.g. University of Utah) ----
+        # For each network in the affiliated_group_entity_map, check if the provider has an active
+        # enrollment under that network's NPDB entity.
+        # Behaviour: if affiliated_groups data is present → only check networks the provider belongs to.
+        #            if absent (field not in SOT) → check ALL networks for ALL providers
+        #            (Utah assumption: every credentialed provider should be in each network entity).
+        if (cfg.affiliated_group_entity_map
+                and expect == "expects_active"
+                and delegation == "Non-Delegated"):
+            ag = str(p.get("affiliated_groups", ""))
+            for network_kw, expected_entity in cfg.affiliated_group_entity_map.items():
+                # If affiliated_groups data exists, skip networks the provider isn't in
+                if ag and network_kw.lower() not in ag.lower():
+                    continue
+                if network_kw.lower() not in ag.lower():
+                    continue   # provider not affiliated with this network
+                entity_matches = [m for m in matched
+                                  if m["entity"].strip().lower() == expected_entity.strip().lower()]
+                entity_enrolled = any(m["enroll_class"] == "active" for m in entity_matches)
+                if entity_enrolled:
+                    network_ok_counts[network_kw] += 1   # track correctly enrolled per network
+                    continue   # coverage present for this network — all good
+                net_prim = (next((m for m in entity_matches if m["enroll_class"] == "active"), None)
+                            or (entity_matches[0] if entity_matches else prim))
+                net_statuses = ("; ".join(sorted({m["enroll_status"] for m in entity_matches
+                                                  if m["enroll_status"]}))
+                                or "(none)")
+                missing_type = "NO_NPDB_RECORD" if not entity_matches else "NOT_ACTIVE_FOR_NETWORK"
+                network_missing_rows.append([
+                    pid, pname, npi, cs,
+                    network_kw,        # network_name  (e.g. "UUHP")
+                    expected_entity,   # expected_entity (the NPDB entity for that network)
+                    ag,                # affiliated_groups (raw, so reviewer can see all groups)
+                    missing_type,
+                    net_statuses,
+                    sot_db, ", ".join(npdb_ids),
+                    tier, score, conf,
+                    *npdb_pts(net_prim, entity_matches or matched)])
+
         if "SHOULD_BE_CANCELLED" in flags:
             for m in matched:
                 if m["enroll_class"] == "active":
-                    cancel_rows.append([pid, pname, npi, cs, m["databank_id"], m["enroll_status"],
-                                        m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"], *npdb3(m)])
+                    cancel_rows.append([pid, pname, npi, cs, tier, score, conf,
+                                        m["databank_id"], m["enroll_status"],
+                                        m["entity"], m["enroll_start"], m["cancel_date"], m["cancelled_by"],
+                                        m["enrolled_by"], *npdb3(m)])
         acts = [f for f in flags if f in ACTIONABLE]
         if acts:
             action_all.append([pid, pname, npi, cs, cyc_raw, expect, " | ".join(acts), n_enr, n_can,
-                               statuses, sot_db, suggested_db, tier, score, conf, conflict, *npdb_pts(prim)])
+                               statuses, sot_db, suggested_db, tier, score, conf, conflict, *npdb_pts(prim, matched)])
 
     # ===================== REVERSE PASS: NPDB enrollments not in our SOT =====================
     # Every NPDB row no provider claimed is an "extra" enrollment. Group those by person,
@@ -870,6 +1012,13 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         ("bad",  "Duplicate enrollment (>1 active)", acct["EXP_DUPLICATE"], "cancel the extras — keep the oldest"),
         ("bad",  "Should be cancelled — terminated", acct["TERM_SHOULD_CANCEL"], "cancel the active NPDB enrollment"),
     ]
+    if cfg.affiliated_group_entity_map and network_missing_rows:
+        _net_cnt_action = Counter(r[4] for r in network_missing_rows)
+        for _nk, _nv in sorted(_net_cnt_action.items()):
+            _ent = next((r[5] for r in network_missing_rows if r[4] == _nk), "")
+            SUMMARY_SPEC.append(
+                ("warn", f"Network gap — {_nk} ({_ent})", _nv,
+                 "trigger NPDB pipeline for this network's providers"))
     if forcred_col:
         SUMMARY_SPEC.append(
             ("bad", "Should be cancelled — delegated", sc_deleg, "cancel the active NPDB enrollment"))
@@ -916,8 +1065,33 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         ("good",    "    HIGH", confc["HIGH"], pct(confc["HIGH"])),
         ("normal",  "    MEDIUM", confc["MEDIUM"], pct(confc["MEDIUM"])),
         ("warn",    "    LOW", confc["LOW"], pct(confc["LOW"])),
-        ("sub",     "    UNMATCHED (no NPDB record)", confc["UNMATCHED"], pct(confc["UNMATCHED"])),
+        ("sub",     "    NONE (no NPDB record)", confc["NONE"], pct(confc["NONE"])),
     ]
+    # ---- Per-network accounting (only when affiliated_group_entity_map is configured AND data exists) ----
+    if cfg.affiliated_group_entity_map:
+        _net_gap_cnt  = Counter(r[4] for r in network_missing_rows)
+        _net_type_cnt = Counter((r[4], r[7]) for r in network_missing_rows)
+        _all_networks = sorted(set(list(_net_gap_cnt.keys()) + list(network_ok_counts.keys())))
+        if _all_networks:
+            SUMMARY_SPEC += [
+                ("blank", "", "", ""),
+                ("section", "Network enrollment accounting (multi-entity)", "", ""),
+            ]
+            for _nk in _all_networks:
+                _ent = cfg.affiliated_group_entity_map.get(_nk, _nk)
+                _ok  = network_ok_counts[_nk]
+                _gap = _net_gap_cnt[_nk]
+                _tot = _ok + _gap
+                _history = _net_type_cnt[(_nk, "NOT_ACTIVE_FOR_NETWORK")]
+                _new_rec  = _net_type_cnt[(_nk, "NO_NPDB_RECORD")]
+                SUMMARY_SPEC += [
+                    ("colhdr", f"{_nk}  —  {_ent}", "Providers", ""),
+                    ("good",  "    Correctly enrolled", _ok,  f"{round(100*_ok/_tot)}%" if _tot else ""),
+                    ("warn",  "    Missing enrollment",  _gap, f"{round(100*_gap/_tot)}%" if _tot else ""),
+                    ("sub",   "        Has NPDB history — not active under this entity", _history, ""),
+                    ("sub",   "        No NPDB record at all",          _new_rec,  ""),
+                    ("blank", "", "", ""),
+                ]
     summary = [[label, value, note] for _style, label, value, note in SUMMARY_SPEC]
 
     # ============ client-facing summary (KPIs + two breakdowns) + a detail page (per-issue tables) ============
@@ -987,6 +1161,29 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         _c("total", "Total", *[sum(xtab_issue[(k, c)] for k in rows_with_data) for c in iss_cols], issues_total)
     else:
         _c("good", "No issues to resolve", "", "")
+
+    # ---- One table per network (Utah multi-entity — only if data exists) ----
+    if cfg.affiliated_group_entity_map:
+        _net_gap_cnt  = Counter(r[4] for r in network_missing_rows)
+        _net_type_cnt = Counter((r[4], r[7]) for r in network_missing_rows)
+        _all_networks = sorted(set(list(_net_gap_cnt.keys()) + list(network_ok_counts.keys())))
+        if not _all_networks:
+            _c("sub", "Network breakdown will appear here after re-running analysis with the network map active.", "")
+        _c("blank", "")
+        _c("section", "Network enrollment — per network breakdown")
+        for _nk in _all_networks:
+            _ent     = next((r[5] for r in network_missing_rows if r[4] == _nk), cfg.affiliated_group_entity_map.get(_nk, ""))
+            _ok      = network_ok_counts[_nk]
+            _gap     = _net_gap_cnt[_nk]
+            _tot     = _ok + _gap
+            _history = _net_type_cnt[(_nk, "NOT_ACTIVE_FOR_NETWORK")]
+            _new_rec = _net_type_cnt[(_nk, "NO_NPDB_RECORD")]
+            _c("blank", "")
+            _c("colhdr", f"{_nk}  —  {_ent}", "Providers", "")
+            _c("good",  "Correctly enrolled",              _ok,       f"{round(100*_ok/_tot)}%"  if _tot else "")
+            _c("warn",  "Missing enrollment (total)",      _gap,      f"{round(100*_gap/_tot)}%" if _tot else "")
+            _c("sub",   "    Has NPDB history — not active under this entity", _history, "")
+            _c("sub",   "    No NPDB record at all",       _new_rec,  "")
     client_layout = {"plast": len(client_summary) - 1}
 
     # ---- client_issues: per-issue detail page (clean provider tables, one section per issue) ----
@@ -1028,6 +1225,34 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         else:
             _ci("good", "None — nothing to resolve here", "", "")
         _ci("blank", "")
+
+    # ---- Per-network detail tables (Utah multi-entity) ----
+    if cfg.affiliated_group_entity_map and network_missing_rows:
+        _net_names = sorted({r[4] for r in network_missing_rows})
+        _ci("section", f"Network enrollment gaps — provider detail  ({len(network_missing_rows)} total)")
+        _ci("sub",
+            "Providers listed here have an active credentialing status but no active enrollment "
+            "under the specified network's NPDB entity. "
+            "Providers missing both networks appear in both sections.", "", "")
+        _ci("blank", "")
+        for _nk in _net_names:
+            _nrows = [r for r in network_missing_rows if r[4] == _nk]
+            _ent   = _nrows[0][5] if _nrows else ""
+            _ci("section", f"  {_nk}  →  {_ent}  ({len(_nrows)} providers)")
+            if _nrows:
+                _ci("colhdr", "Provider", "NPI", "Credentialing status",
+                    "Missing type", "NPDB status", "Databank ID(s)", "Match confidence")
+                for r in _nrows:
+                    # r: [pid, pname, npi, cs, network_kw, expected_entity, ag,
+                    #     missing_type, net_statuses, sot_db, npdb_ids, tier, score, conf, ...]
+                    _ci("matrix", r[1], r[2], r[3],
+                        r[7].replace("_", " ").title(),   # missing_type  (human-readable)
+                        r[8] or "(none)",                  # npdb_statuses
+                        r[10] or "",                       # npdb_databank_ids
+                        r[13] or "NONE")                   # match_confidence
+            else:
+                _ci("good", "None", "")
+            _ci("blank", "")
     issues_layout = {"plast": len(client_issues) - 1}
 
     headers = {
@@ -1040,14 +1265,24 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "expectation","action_items","active_enrollments","cancelled_enrollments","npdb_statuses",
             "sot_databank_id","suggested_databank_id","match_tier","match_score","match_confidence","identity_conflict"] + NPDB_HDR,
         "missing_enrollment": ["providerId","provider_name","npi","credentialingStatus","missing_type",
-            "npdb_statuses","sot_databank_id","npdb_databank_ids","match_tier","match_score"] + NPDB_HDR,
-        "should_be_cancelled": ["providerId","provider_name","npi","credentialingStatus","npdb_databank_id",
-            "npdb_enroll_status","entity","enroll_start_date","cancel_date","cancelled_by"] + NPDB3_HDR,
-        "duplicates": ["providerId","provider_name","npi","credentialingStatus","retain","npdb_databank_id",
-            "npdb_enroll_status","entity","enroll_start_date","cancel_date","cancelled_by"] + NPDB3_HDR,
-        "databank_updates": ["providerId","provider_name","npi","credentialingStatus","update_type",
-            "current_sot_databank_id","suggested_databank_id","npdb_statuses","entity",
-            "enroll_start_date","cancel_date","cancelled_by"] + NPDB3_HDR,
+            "npdb_statuses","sot_databank_id","npdb_databank_ids","match_tier","match_score","match_confidence"] + NPDB_HDR,
+        "network_missing_enrollment": [
+            "providerId","provider_name","npi","credentialingStatus",
+            "network_name","expected_entity","affiliated_groups",
+            "missing_type","npdb_statuses","sot_databank_id","npdb_databank_ids",
+            "match_tier","match_score","match_confidence"] + NPDB_HDR,
+        "should_be_cancelled": ["providerId","provider_name","npi","credentialingStatus",
+            "match_tier","match_score","match_confidence",
+            "npdb_databank_id","npdb_enroll_status","entity","enroll_start_date","cancel_date",
+            "cancelled_by","enrolled_by"] + NPDB3_HDR,
+        "duplicates": ["providerId","provider_name","npi","credentialingStatus",
+            "match_tier","match_score","match_confidence",
+            "retain","npdb_databank_id","npdb_enroll_status","entity","enroll_start_date","cancel_date",
+            "cancelled_by","enrolled_by"] + NPDB3_HDR,
+        "databank_updates": ["providerId","provider_name","npi","credentialingStatus",
+            "match_tier","match_score","match_confidence",
+            "update_type","current_sot_databank_id","suggested_databank_id","npdb_statuses","entity",
+            "enroll_start_date","cancel_date","cancelled_by","enrolled_by"] + NPDB3_HDR,
         "extra_enrollments": ["disposition","suggested_providerId","match_confidence","match_basis","match_score",
             "npdb_databank_ids","npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_licenses","npdb_states",
             "npdb_entity","npdb_enroll_statuses","enroll_start_dates","cancellation_dates","cancelled_by","npdb_record_count",
@@ -1056,6 +1291,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     }
     data = {"summary": summary, "client_summary": client_summary, "client_issues": client_issues,
             "action_items_all": action_all, "missing_enrollment": missing_rows,
+            "network_missing_enrollment": network_missing_rows,
             "should_be_cancelled": cancel_rows, "duplicates": dups, "databank_updates": db_updates,
             "extra_enrollments": extra_rows, "reconciliation": out}
 
@@ -1067,7 +1303,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         existing = {s["properties"]["title"] for s in meta["sheets"]}
         sheet_ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
         order = ["readme","summary","client_summary","client_issues","action_items_all","missing_enrollment",
-                 "should_be_cancelled","duplicates","databank_updates","extra_enrollments","reconciliation"]
+                 "network_missing_enrollment","should_be_cancelled","duplicates","databank_updates",
+                 "extra_enrollments","reconciliation"]
         # remove old TitleCase result tabs (renamed to snake_case)
         old_titlecase = {"README","Summary","Action_Items_All","Missing_Enrollment",
                          "Should_Be_Cancelled","Duplicates","Databank_Updates","Reconciliation"}
@@ -1077,7 +1314,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
                 body={"requests": del_reqs}).execute(), "remove old tabs")
             existing -= old_titlecase
-        data["readme"] = _readme(cfg, sot_tab, npdb_tab, sot_rows is not None, npdb_rows is not None)
+        data["readme"] = _readme(cfg, sot_tab, npdb_tab, sot_rows is not None, npdb_rows is not None,
+                                  network_map=cfg.affiliated_group_entity_map or None)
 
         # ---- stay under Google Sheets' 10M-cells-per-spreadsheet cap ----
         # Cells used by tabs we do NOT rewrite (e.g. the NPDB tab) are fixed; result tabs are
@@ -1092,7 +1330,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                           for s in meta["sheets"] if s["properties"]["title"] not in result_titles)
         over = sum((len(data[n]) + 1) * ncols[n] for n in order) - max(cfg.cell_budget - fixed_cells, 0)
         if over > 0:
-            for n in ("extra_enrollments", "reconciliation", "action_items_all", "missing_enrollment",
+            for n in ("extra_enrollments", "reconciliation", "action_items_all",
+                      "network_missing_enrollment", "missing_enrollment",
                       "should_be_cancelled", "duplicates", "databank_updates"):
                 if over <= 0: break
                 cut = min(len(data[n]), -(-over // ncols[n]))
@@ -1441,56 +1680,87 @@ def _client_summary_reqs(sid, spec, rows, lay):
     # (Native charts intentionally omitted — the client summary is the banded tables only.)
     return reqs
 
-def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False):
-    sot_src = "pulled from BigQuery for the selected client" if sot_from_bq \
-              else f"read from the '{sot_tab}' tab"
-    npdb_src = "pulled from BigQuery via a custom query" if npdb_from_bq \
-               else f"the '{npdb_tab}' tab of this sheet"
-    return [[x] for x in [
+def _readme(cfg, sot_tab, npdb_tab, sot_from_bq=False, npdb_from_bq=False, network_map=None):
+    sot_src  = "BigQuery (for the selected client)" if sot_from_bq else f"'{sot_tab}' tab"
+    npdb_src = "BigQuery (exported via Atlas)" if npdb_from_bq else f"'{npdb_tab}' tab"
+    lines = [
         "NPDB ENROLLMENT RECONCILIATION",
         "",
         "PURPOSE",
-        "  Each provider we credential should hold one active NPDB enrollment; terminated and delegated",
-        "  providers should hold none. This report reconciles every provider's status against their NPDB",
-        "  enrollment for the selected client and lists the discrepancies for us to action.",
+        "  Each credentialed provider should hold one active NPDB enrollment under the correct entity.",
+        "  Terminated and delegated providers should hold none. This report reconciles every provider's",
+        "  credentialing status against their NPDB enrollment and lists the gaps to action.",
         "",
         "INPUTS",
-        f"  • SOT (our records) — {sot_src}: one row per provider.",
-        f"  • NPDB report — {npdb_src}: one row per NPDB enrollment.",
-        "  Each provider is matched to their NPDB record on multiple identity fields (see Methodology).",
+        f"  • SOT (our records)  — {sot_src}: one row per provider.",
+        f"  • NPDB enrollments   — {npdb_src}: one row per NPDB enrollment.",
+        "  Each provider is matched to their NPDB record using NPI, DOB, SSN, license, and name.",
         "",
         "RESULT TABS",
-        "  client_summary       Client-facing overview: provider buckets (delegation x active/terminated)",
-        "                       vs NPDB enrollment status. No internal action items.",
-        "  summary              Headline figures and the actions required.",
-        "  missing_enrollment   Should be enrolled but is not (or not active) — we enroll the provider.",
-        "  duplicates           More than one active enrollment — we cancel the extras, keeping the oldest.",
-        "  should_be_cancelled  Terminated or delegated but still enrolled — we cancel the enrollment.",
-        "  databank_updates     The databank id on record is missing or incorrect — we correct it in the SOT.",
-        "  extra_enrollments    NPDB enrollments with no matching provider — we link them or add the provider.",
-        "  reconciliation       Full line-by-line result for every provider (audit trail).",
+        "  readme                 This page.",
+        "  summary                Headline KPIs and full accounting by bucket.",
+        "  client_summary         Client-facing overview: enrollment status by credentialing status.",
+        "  client_issues          Detailed provider tables per issue type (client-facing).",
+        "  action_items_all       Every provider with at least one action needed (full detail).",
+        "  missing_enrollment     Providers who should be enrolled but are not — trigger their pipeline.",
+        "  should_be_cancelled    Terminated/delegated providers still enrolled — cancel the enrollment.",
+        "  duplicates             Providers with more than one active enrollment — cancel the extras.",
+        "  databank_updates       Databank ID on record is missing or wrong — patch via API.",
+        "  extra_enrollments      NPDB enrollments with no matching SOT provider — link or add them.",
+        "  reconciliation         Full line-by-line result for every provider (audit trail).",
+    ]
+    if network_map:
+        lines += [
+            "  network_missing_enrollment",
+        ]
+        for kw, ent in sorted(network_map.items()):
+            lines.append(f"                         {kw} ({ent}): providers missing enrollment under this entity.")
+        lines.append("                         One row per provider × network gap. Action via Atlas → Action Items.")
+    lines += [
         "",
         "NOTES",
-        "  • This is a report; it does not modify NPDB or any system. We action the items.",
-        "  • Re-running overwrites these tabs. Retain a copy beforehand if needed.",
-        "  • Matching uses full identity (NPI with name, DOB, license and gender), never NPI alone.",
-        "    Uncertain matches are flagged under 'identity conflicts' for review.",
-        "  • Providers still in progress are not reported as missing.",
-        "  • Delegated handling applies only when the client's data includes the for-credentialing flag.",
+        "  • This is a report only — it does not modify NPDB or any system. Actions are taken via Atlas.",
+        "  • Re-running analysis overwrites all result tabs. Keep a copy before re-running if needed.",
+        "  • Matching uses full identity (NPI, DOB, SSN, license, name, gender). NPI alone is never used.",
+        "    Uncertain matches are flagged as identity conflicts for manual review.",
+        "  • Providers still in progress (In Progress, Data Missing, etc.) are not flagged as missing",
+        "    unless they are Recredentialing (already credentialed — already should be enrolled).",
+        "  • Delegated providers (businessPurpose_isForCredentialing = false) are never expected to enroll.",
+        "  • Canceller Name and Submitter Name come from the NPDB export. These are blank when NPDB",
+        "    does not populate them (common for active enrollments).",
         "  • Gender and SSN are sourced from CAQH; where absent, they are not used in matching.",
+    ]
+    if network_map:
+        lines += [
+            "",
+            "MULTI-ENTITY (NETWORK-LEVEL) RECONCILIATION",
+            "  This result was run for a multi-entity client with the following network map:",
+        ]
+        for kw, ent in sorted(network_map.items()):
+            lines.append(f"    {kw}  →  {ent}")
+        lines += [
+            "  For each network, every active non-delegated provider is checked for an active enrollment",
+            "  specifically under that network's NPDB entity. A provider correctly enrolled under UUHP",
+            "  but missing under HCU will appear in network_missing_enrollment under HCU only.",
+            "  Having one enrollment per network entity is correct — it is NOT flagged as a duplicate.",
+        ]
+    lines += [
         "",
         "METHODOLOGY",
-        "  Our status -> meaning:",
-        f"    Active     : {', '.join(sorted(cfg.active_statuses))}",
-        f"    Terminated : {', '.join(sorted(cfg.terminated_statuses))}",
-        "    In progress: not evaluated for missing/duplicate. Recredentialing also expects an active enrollment.",
-        "    businessPurpose_isForCredentialing: true = direct (expect enrollment); false = delegated (none).",
-        "  NPDB status -> meaning:",
-        f"    Enrolled (active): {', '.join(sorted(cfg.npdb_active))}; Cancelled: {', '.join(sorted(cfg.npdb_cancelled))}.",
-        "  Identity match (points): NPI +50, SSN-last4 +30, DOB +20, license# +25, name (fuzzy), middle/state/gender +5;",
-        f"    gender disagreement -10. Requires an anchor; minimum accept score {int(cfg.accept_score)}. Confidence HIGH/MEDIUM/LOW.",
-        "  Accounting buckets are mutually exclusive and sum to the provider total. Databank fixes, identity",
-        "  conflicts and extra enrollments are counted separately. Large tabs split into <name>_2, _3, ….",
+        "  Credentialing status → expectation:",
+        f"    Expects enrollment : {', '.join(sorted(cfg.active_statuses))} (+ Recredentialing)",
+        f"    Terminated         : {', '.join(sorted(cfg.terminated_statuses))}",
+        "    In progress        : not evaluated (no action). Delegated: never expected.",
+        "  NPDB status:",
+        f"    Active  : {', '.join(sorted(cfg.npdb_active))}",
+        f"    Inactive: {', '.join(sorted(cfg.npdb_cancelled))}",
+        "  Identity scoring: NPI +50, SSN-last4 +30, DOB +20, license +25, name (fuzzy), state/gender +5;",
+        f"    gender conflict -10. Minimum score to accept a match: {int(cfg.accept_score)}.",
+        "  Match confidence: HIGH = NPI/SSN/DOB signal; MEDIUM = name+license; LOW = name only; NONE = unmatched.",
+        "  Accounting buckets are mutually exclusive and sum to total providers. Databank fixes, identity",
+        "  conflicts, and extra enrollments overlap the main buckets and are counted separately.",
+        "  Large tabs split into <name>_2, <name>_3, … when they exceed the row limit.",
         "",
-        f"  Access: share this sheet (Editor) with {SA_EMAIL}.",
-    ]]
+        f"  Share this sheet (Editor) with {SA_EMAIL} to allow Atlas to write results.",
+    ]
+    return [[line] for line in lines]
