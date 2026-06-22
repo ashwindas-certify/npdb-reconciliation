@@ -627,6 +627,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
     network_missing_rows = []   # per-network enrollment gaps (populated when affiliated_group_entity_map is set)
     network_ok_counts    = Counter()   # network_kw → providers correctly enrolled under that entity
+    # (cs, coverage) → count  where coverage = "UUHP", "HCU", "Both", "None", etc.
+    xtab_network         = Counter()
     client_recon = []          # trimmed, plain-language reconciliation for the client workbook
     # client_summary breakdowns (counts only): expected providers by credentialingStatus x NPDB
     # status, and issues by issue-type x NPDB status. (extra issues are folded in after the loop.)
@@ -870,6 +872,22 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                                  ("NO_NPDB_RECORD" if not matched else "ENROLLMENT_NOT_ACTIVE"),
                                  statuses or "(none)", sot_db, ", ".join(npdb_ids), tier, score, conf, *npdb_pts(prim, matched)])
 
+        # ---- Network coverage cross-tab (for the client_summary network matrix) ----
+        if cfg.affiliated_group_entity_map and expect == "expects_active" and delegation == "Non-Delegated":
+            _enrolled_nets = set()
+            for _nkw, _nent in cfg.affiliated_group_entity_map.items():
+                _em = [m for m in matched if m["entity"].strip().lower() == _nent.strip().lower()]
+                if any(m["enroll_class"] == "active" for m in _em):
+                    _enrolled_nets.add(_nkw)
+            _all_nets = set(cfg.affiliated_group_entity_map.keys())
+            if not _enrolled_nets:
+                _coverage = "None"
+            elif _enrolled_nets == _all_nets:
+                _coverage = "Both" if len(_all_nets) == 2 else "All"
+            else:
+                _coverage = " + ".join(sorted(_enrolled_nets))
+            xtab_network[(cs.strip() or "(blank)", _coverage)] += 1
+
         # ---- Network-level enrollment check (multi-entity clients, e.g. University of Utah) ----
         # For each network in the affiliated_group_entity_map, check if the provider has an active
         # enrollment under that network's NPDB entity.
@@ -1067,31 +1085,23 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         ("warn",    "    LOW", confc["LOW"], pct(confc["LOW"])),
         ("sub",     "    NONE (no NPDB record)", confc["NONE"], pct(confc["NONE"])),
     ]
-    # ---- Per-network accounting (only when affiliated_group_entity_map is configured AND data exists) ----
-    if cfg.affiliated_group_entity_map:
-        _net_gap_cnt  = Counter(r[4] for r in network_missing_rows)
-        _net_type_cnt = Counter((r[4], r[7]) for r in network_missing_rows)
-        _all_networks = sorted(set(list(_net_gap_cnt.keys()) + list(network_ok_counts.keys())))
-        if _all_networks:
-            SUMMARY_SPEC += [
-                ("blank", "", "", ""),
-                ("section", "Network enrollment accounting (multi-entity)", "", ""),
-            ]
-            for _nk in _all_networks:
-                _ent = cfg.affiliated_group_entity_map.get(_nk, _nk)
-                _ok  = network_ok_counts[_nk]
-                _gap = _net_gap_cnt[_nk]
-                _tot = _ok + _gap
-                _history = _net_type_cnt[(_nk, "NOT_ACTIVE_FOR_NETWORK")]
-                _new_rec  = _net_type_cnt[(_nk, "NO_NPDB_RECORD")]
-                SUMMARY_SPEC += [
-                    ("colhdr", f"{_nk}  —  {_ent}", "Providers", ""),
-                    ("good",  "    Correctly enrolled", _ok,  f"{round(100*_ok/_tot)}%" if _tot else ""),
-                    ("warn",  "    Missing enrollment",  _gap, f"{round(100*_gap/_tot)}%" if _tot else ""),
-                    ("sub",   "        Has NPDB history — not active under this entity", _history, ""),
-                    ("sub",   "        No NPDB record at all",          _new_rec,  ""),
-                    ("blank", "", "", ""),
-                ]
+    # ---- Network enrollment coverage summary (multi-entity) ----
+    if cfg.affiliated_group_entity_map and xtab_network:
+        _all_nets_s = sorted(cfg.affiliated_group_entity_map.keys())
+        _combos = _all_nets_s + (["Both"] if len(_all_nets_s) == 2 else ["All"] if len(_all_nets_s) > 2 else []) + ["None"]
+        _combo_totals = {col: sum(v for (_, c), v in xtab_network.items() if c == col) for col in _combos}
+        _tot_expected = sum(xtab_network.values())
+        SUMMARY_SPEC += [
+            ("blank", "", "", ""),
+            ("section", "Network enrollment coverage (multi-entity)", _tot_expected, "expected providers"),
+        ]
+        for _col in _combos:
+            _n = _combo_totals.get(_col, 0)
+            _style = "good" if _col not in ("None",) else "warn"
+            _label = f"    {_col}"
+            if _col in cfg.affiliated_group_entity_map:
+                _label += f"  ({cfg.affiliated_group_entity_map[_col][:40]})"
+            SUMMARY_SPEC.append((_style, _label, _n, pct(_n)))
     summary = [[label, value, note] for _style, label, value, note in SUMMARY_SPEC]
 
     # ============ client-facing summary (KPIs + two breakdowns) + a detail page (per-issue tables) ============
@@ -1162,28 +1172,40 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     else:
         _c("good", "No issues to resolve", "", "")
 
-    # ---- One table per network (Utah multi-entity — only if data exists) ----
-    if cfg.affiliated_group_entity_map:
-        _net_gap_cnt  = Counter(r[4] for r in network_missing_rows)
-        _net_type_cnt = Counter((r[4], r[7]) for r in network_missing_rows)
-        _all_networks = sorted(set(list(_net_gap_cnt.keys()) + list(network_ok_counts.keys())))
-        if not _all_networks:
-            _c("sub", "Network breakdown will appear here after re-running analysis with the network map active.", "")
+    # ---- Network enrollment matrix: credentialing status × network coverage ----
+    if cfg.affiliated_group_entity_map and xtab_network:
+        _all_nets_sorted = sorted(cfg.affiliated_group_entity_map.keys())
+        # Column order: each individual network, then "Both" / "All", then "None"
+        _combo_cols = _all_nets_sorted.copy()
+        if len(_all_nets_sorted) == 2:
+            _combo_cols.append("Both")
+        elif len(_all_nets_sorted) > 2:
+            _combo_cols.append("All")
+        _combo_cols.append("None")
+        # Column display labels: show short name + partial entity name
+        _col_labels = []
+        for _col_key in _combo_cols:
+            if _col_key in cfg.affiliated_group_entity_map:
+                _ent_name = cfg.affiliated_group_entity_map[_col_key]
+                _col_labels.append(f"{_col_key} — {_ent_name[:30]}")
+            else:
+                _col_labels.append(_col_key)
+        _cs_rows = sorted({k[0] for k in xtab_network},
+                          key=lambda s: (-sum(v for kk, v in xtab_network.items() if kk[0] == s), s))
         _c("blank", "")
-        _c("section", "Network enrollment — per network breakdown")
-        for _nk in _all_networks:
-            _ent     = next((r[5] for r in network_missing_rows if r[4] == _nk), cfg.affiliated_group_entity_map.get(_nk, ""))
-            _ok      = network_ok_counts[_nk]
-            _gap     = _net_gap_cnt[_nk]
-            _tot     = _ok + _gap
-            _history = _net_type_cnt[(_nk, "NOT_ACTIVE_FOR_NETWORK")]
-            _new_rec = _net_type_cnt[(_nk, "NO_NPDB_RECORD")]
-            _c("blank", "")
-            _c("colhdr", f"{_nk}  —  {_ent}", "Providers", "")
-            _c("good",  "Correctly enrolled",              _ok,       f"{round(100*_ok/_tot)}%"  if _tot else "")
-            _c("warn",  "Missing enrollment (total)",      _gap,      f"{round(100*_gap/_tot)}%" if _tot else "")
-            _c("sub",   "    Has NPDB history — not active under this entity", _history, "")
-            _c("sub",   "    No NPDB record at all",       _new_rec,  "")
+        _c("section", "Network enrollment coverage — by credentialing status")
+        _c("sub", "Shows how many providers (of each cred status) are enrolled under each network combination.", "")
+        _c("blank", "")
+        _c("colhdr", "Credentialing status", *_col_labels, "Total expected")
+        for _cs_v in _cs_rows:
+            _vals = [xtab_network[(_cs_v, col)] for col in _combo_cols]
+            _c("matrix", _cs_v, *_vals, sum(_vals))
+        _c("total", "Total",
+           *[sum(xtab_network[(_cs_v, col)] for _cs_v in _cs_rows) for col in _combo_cols],
+           sum(xtab_network.values()))
+    elif cfg.affiliated_group_entity_map:
+        _c("blank", "")
+        _c("sub", "Network coverage matrix will appear here after re-running analysis with both entities in BigQuery.", "")
     client_layout = {"plast": len(client_summary) - 1}
 
     # ---- client_issues: per-issue detail page (clean provider tables, one section per issue) ----
