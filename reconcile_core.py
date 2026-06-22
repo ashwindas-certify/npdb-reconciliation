@@ -618,6 +618,18 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         idxs, tier, score, conf, conflict = match(p)
         matched_any.update(idxs)
         matched = [npdb[i] for i in idxs]
+        # Deduplicate by databank_id — the same enrollment can appear more than once in an
+        # export that spans multiple search passes; blank-NPI "No License" rows have no id
+        # and are kept as-is.
+        _seen_db, _deduped = set(), []
+        for _m in matched:
+            _db = _m["databank_id"]
+            if _db and _db in _seen_db:
+                continue
+            if _db:
+                _seen_db.add(_db)
+            _deduped.append(_m)
+        matched = _deduped
         prim = next((m for m in matched if m["enroll_class"] == "active"), matched[0] if matched else None)
         n_enr = sum(1 for m in matched if m["enroll_class"] == "active")
         n_can = sum(1 for m in matched if m["enroll_class"] == "cancelled")
