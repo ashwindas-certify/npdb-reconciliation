@@ -27,7 +27,7 @@ SA_EMAIL = "sheet-access@create-494211.iam.gserviceaccount.com"   # share client
 # ----------------- BigQuery SOT source (CertifyOS) -----------------
 # Default project + queries. SOT is filtered by organization name via @client (parameterized).
 # Auth is YOUR local ADC (gcloud auth application-default login) — no service account.
-DEFAULT_BQ_PROJECT = "certifyos-production-platform"
+DEFAULT_BQ_PROJECT = "certifyos-development"
 
 SOT_SQL = """
 WITH state_licenses AS (
@@ -185,13 +185,29 @@ def get_drive_service(sa_key_path: str | None = None):
 # --------------------------- BigQuery (SOT source) ---------------------------
 # Auth is YOUR local Application Default Credentials — NO service account needed.
 # One-time:  gcloud auth application-default login
+import threading as _threading
+_bq_clients: dict = {}
+_bq_lock = _threading.Lock()
+
+def _bq_client(project: str | None = None):
+    """Return a cached bigquery.Client for `project` (created once, reused forever).
+    Thread-safe: the first caller initialises it; concurrent callers wait for that result."""
+    key = project or ""
+    if key not in _bq_clients:
+        with _bq_lock:
+            if key not in _bq_clients:          # double-checked locking
+                from google.cloud import bigquery
+                _bq_clients[key] = bigquery.Client(project=project) if project else bigquery.Client()
+    return _bq_clients[key]
+
+
 def bq_rows(sql: str, params: dict | None = None, project: str | None = None, progress=None):
     """Run a parameterized query and return rows as list[dict] — same shape as read_tab(),
     so the rest of reconcile() is source-agnostic. `params` -> @name STRING params,
     e.g. bq_rows(SOT_SQL, {'client': 'Headway'}). Values come back native (dates/bools);
     the normalizers str()-coerce them, so no extra casting is needed."""
     from google.cloud import bigquery
-    client = bigquery.Client(project=project) if project else bigquery.Client()
+    client = _bq_client(project)
     job_cfg = None
     if params:
         bq_params = []
@@ -629,6 +645,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     network_ok_counts    = Counter()   # network_kw → providers correctly enrolled under that entity
     # (cs, coverage) → count  where coverage = "UUHP", "HCU", "Both", "None", etc.
     xtab_network         = Counter()
+    # (network_kw, npdb_status) → count  for the client_summary "network vs NPDB status" matrix
+    xtab_net_npdb        = Counter()
     client_recon = []          # trimmed, plain-language reconciliation for the client workbook
     # client_summary breakdowns (counts only): expected providers by credentialingStatus x NPDB
     # status, and issues by issue-type x NPDB status. (extra issues are folded in after the loop.)
@@ -879,6 +897,16 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                 _em = [m for m in matched if m["entity"].strip().lower() == _nent.strip().lower()]
                 if any(m["enroll_class"] == "active" for m in _em):
                     _enrolled_nets.add(_nkw)
+                # track per-network NPDB status for the client_summary matrix
+                if not _em:
+                    _net_st = "No NPDB record"
+                elif any(m["enroll_class"] == "active" for m in _em):
+                    _net_st = "Enrolled"
+                elif any(m["enroll_class"] == "cancelled" for m in _em):
+                    _net_st = "Canceled"
+                else:
+                    _net_st = next((m["enroll_status"] for m in _em if m["enroll_status"]), "Other")
+                xtab_net_npdb[(_nkw, _net_st)] += 1
             _all_nets = set(cfg.affiliated_group_entity_map.keys())
             if not _enrolled_nets:
                 _coverage = "None"
@@ -982,7 +1010,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         disp = "LINK_TO_PROVIDER" if link else "ADD_TO_SOT"
         if link: n_extra_link += 1
         else:    n_extra_new += 1
-        db_ids   = sorted({x["databank_id"] for x in ms if x["databank_id"]})
+        db_ids      = sorted({x["databank_id"] for x in ms if x["databank_id"]})
+        active_dbs  = sorted({x["databank_id"] for x in ms if x["enroll_class"] == "active" and x["databank_id"]})
         licenses = sorted({x["raw_license"] for x in ms if x["raw_license"]})
         states   = sorted({x["state"] for x in ms if x["state"]})
         statuses = "; ".join(sorted({x["enroll_status"] for x in ms if x["enroll_status"]}))
@@ -996,7 +1025,9 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             " | ".join(licenses), ", ".join(states), rep["entity"], statuses, starts, cancels, cancelby, len(ms),
             # ready-to-append SOT row (providerId blank — to create/link):
             "", rep["raw_first"], rep["raw_last"], rep["raw_middle"], rep["npi"], rep["dob"],
-            rep["ssn4"], " | ".join(licenses), ", ".join(states)])
+            rep["ssn4"], " | ".join(licenses), ", ".join(states),
+            # active databank ids only (for cancellation action items):
+            ", ".join(active_dbs)])
     # LINK rows first (actionable now), then ADD rows; within each, most enrollments first
     extra_rows.sort(key=lambda r: (r[0] != "LINK_TO_PROVIDER", -r[17]))
 
@@ -1085,23 +1116,24 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         ("warn",    "    LOW", confc["LOW"], pct(confc["LOW"])),
         ("sub",     "    NONE (no NPDB record)", confc["NONE"], pct(confc["NONE"])),
     ]
-    # ---- Network enrollment coverage summary (multi-entity) ----
-    if cfg.affiliated_group_entity_map and xtab_network:
-        _all_nets_s = sorted(cfg.affiliated_group_entity_map.keys())
-        _combos = _all_nets_s + (["Both"] if len(_all_nets_s) == 2 else ["All"] if len(_all_nets_s) > 2 else []) + ["None"]
-        _combo_totals = {col: sum(v for (_, c), v in xtab_network.items() if c == col) for col in _combos}
-        _tot_expected = sum(xtab_network.values())
+    # ---- Network vs NPDB status summary (multi-entity, expected providers only) ----
+    if cfg.affiliated_group_entity_map and xtab_net_npdb:
+        _net_rows_s = sorted(cfg.affiliated_group_entity_map.keys())
+        _net_sts_s  = sorted({s for (_, s) in xtab_net_npdb},
+                             key=lambda s: (s == "No NPDB record", s != "Enrolled", s))
         SUMMARY_SPEC += [
             ("blank", "", "", ""),
-            ("section", "Network enrollment coverage (multi-entity)", _tot_expected, "expected providers"),
+            ("section", "Network vs NPDB enrollment status — expected providers only", "", ""),
         ]
-        for _col in _combos:
-            _n = _combo_totals.get(_col, 0)
-            _style = "good" if _col not in ("None",) else "warn"
-            _label = f"    {_col}"
-            if _col in cfg.affiliated_group_entity_map:
-                _label += f"  ({cfg.affiliated_group_entity_map[_col][:40]})"
-            SUMMARY_SPEC.append((_style, _label, _n, pct(_n)))
+        for _nkw in _net_rows_s:
+            _ent_name  = cfg.affiliated_group_entity_map[_nkw]
+            _net_total = sum(xtab_net_npdb[(_nkw, s)] for s in _net_sts_s)
+            _pct_net   = (lambda n, t=_net_total: f"{round(100 * n / t)}% of {_nkw}" if t else "")
+            SUMMARY_SPEC.append(("sub", f"    {_nkw}  ({_ent_name[:40]})", _net_total, "expected"))
+            for _st in _net_sts_s:
+                _n = xtab_net_npdb[(_nkw, _st)]
+                _style = "good" if _st == "Enrolled" else ("warn" if _st == "No NPDB record" else "normal")
+                SUMMARY_SPEC.append((_style, f"        {_st}", _n, _pct_net(_n)))
     summary = [[label, value, note] for _style, label, value, note in SUMMARY_SPEC]
 
     # ============ client-facing summary (KPIs + two breakdowns) + a detail page (per-issue tables) ============
@@ -1115,10 +1147,12 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     pct_exp = f"{round(100 * n_exp_enrolled / n_expected)}% of expected" if n_expected else ""
 
     # fold the reverse-pass "extra" enrollments into the issue x NPDB-status counter + the detail rows
+    # Only count / show extra rows that have at least one active enrollment (the actionable ones).
     for r in extra_rows:
-        xtab_issue[("extra", (str(r[13]).split(";")[0].strip() or "Enrolled"))] += 1
+        if r[27]:  # active_npdb_databank_ids non-empty → has at least one active enrollment
+            xtab_issue[("extra", (str(r[13]).split(";")[0].strip() or "Enrolled"))] += 1
     # name,npi,dob,db_ids,entity,statuses, enroll_start, cancel_date, cancelled_by
-    cli_extra = [[r[6], r[7], r[8], r[5], r[12], r[13], r[14], r[15], r[16]] for r in extra_rows]
+    cli_extra = [[r[6], r[7], r[8], r[5], r[12], r[13], r[14], r[15], r[16]] for r in extra_rows if r[27]]
     # name,npi,cred,issue,current,correct, enroll_start, cancel_date, cancelled_by
     cli_databank = [[u[1], u[2], u[3], u[4], u[5], u[6], u[9], u[10], u[11]] for u in db_updates]
 
@@ -1172,40 +1206,28 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     else:
         _c("good", "No issues to resolve", "", "")
 
-    # ---- Network enrollment matrix: credentialing status × network coverage ----
-    if cfg.affiliated_group_entity_map and xtab_network:
-        _all_nets_sorted = sorted(cfg.affiliated_group_entity_map.keys())
-        # Column order: each individual network, then "Both" / "All", then "None"
-        _combo_cols = _all_nets_sorted.copy()
-        if len(_all_nets_sorted) == 2:
-            _combo_cols.append("Both")
-        elif len(_all_nets_sorted) > 2:
-            _combo_cols.append("All")
-        _combo_cols.append("None")
-        # Column display labels: show short name + partial entity name
-        _col_labels = []
-        for _col_key in _combo_cols:
-            if _col_key in cfg.affiliated_group_entity_map:
-                _ent_name = cfg.affiliated_group_entity_map[_col_key]
-                _col_labels.append(f"{_col_key} — {_ent_name[:30]}")
-            else:
-                _col_labels.append(_col_key)
-        _cs_rows = sorted({k[0] for k in xtab_network},
-                          key=lambda s: (-sum(v for kk, v in xtab_network.items() if kk[0] == s), s))
+    # ---- Network matrix: network rows × NPDB enrollment status columns ----
+    if cfg.affiliated_group_entity_map and xtab_net_npdb:
+        _net_rows = sorted(cfg.affiliated_group_entity_map.keys())
+        # Column order: Enrolled first, No NPDB record last, others alphabetically between
+        _net_statuses = sorted({s for (_, s) in xtab_net_npdb},
+                               key=lambda s: (s == "No NPDB record", s != "Enrolled", s))
         _c("blank", "")
-        _c("section", "Network enrollment coverage — by credentialing status")
-        _c("sub", "Shows how many providers (of each cred status) are enrolled under each network combination.", "")
+        _c("section", "Network vs NPDB enrollment status")
+        _c("sub", "Expected providers only (Active, Non-Delegated) — NPDB enrollment status per network entity.", "")
         _c("blank", "")
-        _c("colhdr", "Credentialing status", *_col_labels, "Total expected")
-        for _cs_v in _cs_rows:
-            _vals = [xtab_network[(_cs_v, col)] for col in _combo_cols]
-            _c("matrix", _cs_v, *_vals, sum(_vals))
+        _c("colhdr", "Network", *_net_statuses, "Total")
+        for _nkw in _net_rows:
+            _ent_name = cfg.affiliated_group_entity_map[_nkw]
+            _lbl = f"{_nkw}  ({_ent_name[:35]})"
+            _vals = [xtab_net_npdb[(_nkw, s)] for s in _net_statuses]
+            _c("matrix", _lbl, *_vals, sum(_vals))
         _c("total", "Total",
-           *[sum(xtab_network[(_cs_v, col)] for _cs_v in _cs_rows) for col in _combo_cols],
-           sum(xtab_network.values()))
+           *[sum(xtab_net_npdb[(_nkw, s)] for _nkw in _net_rows) for s in _net_statuses],
+           sum(xtab_net_npdb.values()))
     elif cfg.affiliated_group_entity_map:
         _c("blank", "")
-        _c("sub", "Network coverage matrix will appear here after re-running analysis with both entities in BigQuery.", "")
+        _c("sub", "Network matrix will appear here after re-running analysis with both entities in BigQuery.", "")
     client_layout = {"plast": len(client_summary) - 1}
 
     # ---- client_issues: per-issue detail page (clean provider tables, one section per issue) ----
@@ -1309,7 +1331,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "npdb_databank_ids","npdb_name","npdb_npi","npdb_dob","npdb_ssn_last4","npdb_licenses","npdb_states",
             "npdb_entity","npdb_enroll_statuses","enroll_start_dates","cancellation_dates","cancelled_by","npdb_record_count",
             "append_providerId","append_firstName","append_lastName","append_middleName","append_npi",
-            "append_dateOfBirth","append_ssn_last4","append_license","append_license_state"],
+            "append_dateOfBirth","append_ssn_last4","append_license","append_license_state",
+            "active_npdb_databank_ids"],
     }
     data = {"summary": summary, "client_summary": client_summary, "client_issues": client_issues,
             "action_items_all": action_all, "missing_enrollment": missing_rows,
