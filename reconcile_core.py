@@ -1478,8 +1478,6 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                        "warn" if "incomplete" in _plabel.lower() or "No pipeline" in _plabel else
                        "good" if "Pipeline OK" in _plabel else "sub")
             _c(_pstyle, _plabel, _pcount, "")
-        _c("sub",
-           "See the missing_enrollment tab for the full detail: which step failed and the plain-English reason.", "", "")
 
     client_layout = {"plast": len(client_summary) - 1}
 
