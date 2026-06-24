@@ -340,6 +340,36 @@ LEFT JOIN fetch_npdb_request req ON req.provider_id   = p.pid
 LEFT JOIN fetch_npdb_enroll enr  ON enr.provider_id   = p.pid"""
 
 
+_LAYMAN_ERRORS = [
+    (r"timeout|timed.?out|deadline.exceeded",              "Request timed out — the external service didn't respond"),
+    (r"invalid.?npi|npi.not.found|npi.*invalid",           "Provider's NPI wasn't found in the national registry"),
+    (r"not.found.in.nppes|nppes",                          "Issue accessing NPI registry (NPPES)"),
+    (r"caqh.*not.found|no.caqh|caqh.profile",              "Provider's CAQH profile could not be retrieved"),
+    (r"proview|pdqs|pecos",                                "Issue accessing a credentialing database"),
+    (r"license.*not.found|no.*license",                    "No active license found for this provider"),
+    (r"duplicate|already.enrolled|already.exists",         "Provider already has an existing enrollment record"),
+    (r"missing.*field|required.*field|required.*missing",  "Required information is missing from the provider's profile"),
+    (r"unauthorized|401|invalid.*token|expired.*token",    "Authentication expired — pipeline credentials need refreshing"),
+    (r"500|internal.server.error",                         "External service had an internal error — usually transient"),
+    (r"connection|network.*error|unreachable|econnrefused","Could not reach the external service — network issue"),
+    (r"provider.*not.found|no.provider",                   "Provider record not found in CertifyOS"),
+    (r"organisation.*not.found|org.*not.found",            "Organisation not found — check the org configuration"),
+    (r"rate.limit|429|too.many.requests",                  "Too many requests sent — rate limit hit, needs a retry"),
+    (r"null|undefined|cannot.read",                        "Unexpected empty data returned by the service"),
+]
+
+def _layman_error(msg: str) -> str:
+    """Translate a technical pipeline error message to plain English."""
+    if not msg:
+        return ""
+    lower = msg.lower()
+    for pattern, friendly in _LAYMAN_ERRORS:
+        if re.search(pattern, lower):
+            return friendly
+    clean = re.sub(r"\s+", " ", msg.strip())
+    return clean[:140] + ("…" if len(clean) > 140 else "")
+
+
 def _pipeline_row_summary(row: dict) -> dict:
     """Derive human-readable summary + grouping label from one pipeline status row."""
     sts = {k: (row.get(sc) or "").upper() for k, sc, ec in _PIPELINE_STEPS}
@@ -360,13 +390,13 @@ def _pipeline_row_summary(row: dict) -> dict:
         pstatus = "SUCCESS"
     elif first_fail and first_fail not in _NPDB_STEPS:
         group   = f"Pre-NPDB failure: {first_fail}"
-        reason  = err[first_fail] or sts[first_fail]
-        detail  = f"Pre-NPDB failure at {first_fail}: {reason}"
+        reason  = _layman_error(err[first_fail]) or err[first_fail] or sts[first_fail]
+        detail  = f"Stopped at {first_fail}: {reason}"
         pstatus = "FAILED"
     elif first_fail and first_fail in _NPDB_STEPS:
         group   = f"NPDB step failed: {first_fail}"
-        reason  = err[first_fail] or sts[first_fail]
-        detail  = f"NPDB step failed ({first_fail}): {reason}"
+        reason  = _layman_error(err[first_fail]) or err[first_fail] or sts[first_fail]
+        detail  = f"NPDB enrollment step failed ({first_fail}): {reason}"
         pstatus = "FAILED"
     elif missing and not first_fail:
         label   = missing[0] if len(missing) == 1 else f"{len(missing)} steps"
@@ -378,19 +408,22 @@ def _pipeline_row_summary(row: dict) -> dict:
         detail  = group
         pstatus = "UNKNOWN"
 
-    pre_step   = first_fail if first_fail and first_fail not in _NPDB_STEPS else ""
-    pre_reason = (err.get(pre_step) or sts.get(pre_step, "")) if pre_step else ""
+    pre_step      = first_fail if first_fail and first_fail not in _NPDB_STEPS else ""
+    pre_err_raw   = (err.get(pre_step) or sts.get(pre_step, "")) if pre_step else ""
+    pre_reason    = _layman_error(pre_err_raw) if pre_err_raw else ""
+    npdb_req_err  = _layman_error(err.get("fetch_npdb_request", ""))
+    npdb_enr_err  = _layman_error(err.get("fetch_npdb_enroll", ""))
 
     return {
-        "pipeline_status":          pstatus,
-        "pipeline_group":           group,   # short label for top-5 grouping
-        "pipeline_summary":         detail,  # full message for the sheet
-        "pre_npdb_failed_step":     pre_step,
-        "pre_npdb_failed_reason":   pre_reason,
+        "pipeline_status":           pstatus,
+        "pipeline_group":            group,   # short label for top-5 grouping
+        "pipeline_summary":          detail,  # full message for the sheet
+        "pre_npdb_failed_step":      pre_step,
+        "pre_npdb_failed_reason":    pre_reason,
         "fetch_npdb_request_status": sts["fetch_npdb_request"],
-        "fetch_npdb_request_error":  err["fetch_npdb_request"],
+        "fetch_npdb_request_error":  npdb_req_err,
         "fetch_npdb_enroll_status":  sts["fetch_npdb_enroll"],
-        "fetch_npdb_enroll_error":   err["fetch_npdb_enroll"],
+        "fetch_npdb_enroll_error":   npdb_enr_err,
     }
 
 
@@ -1303,6 +1336,23 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         ("warn",    "    LOW", confc["LOW"], pct(confc["LOW"])),
         ("sub",     "    NONE (no NPDB record)", confc["NONE"], pct(confc["NONE"])),
     ]
+    # ---- Pipeline status breakdown for missing enrollments ----
+    if missing_pipeline_reasons and acct["EXP_MISSING"] > 0:
+        SUMMARY_SPEC += [
+            ("blank", "", "", ""),
+            ("section", "Missing enrollments — why the pipeline didn't enroll them", "", ""),
+            ("sub",     "    Based on the latest pipeline run per provider", "", ""),
+        ]
+        _pipe_style = {
+            "No pipeline run found":    "warn",
+            "Pipeline OK":              "good",
+        }
+        for _plabel, _pcount in missing_pipeline_reasons:
+            _pstyle = ("bad"  if "Pre-NPDB" in _plabel or "NPDB step failed" in _plabel else
+                       "warn" if "incomplete" in _plabel.lower() or "No pipeline" in _plabel else
+                       "good" if "Pipeline OK" in _plabel else "sub")
+            SUMMARY_SPEC.append((_pstyle, f"    {_plabel}", _pcount, ""))
+
     # ---- Network vs NPDB status summary (multi-entity, expected providers only) ----
     if cfg.affiliated_group_entity_map and xtab_net_npdb:
         _net_rows_s = sorted(cfg.affiliated_group_entity_map.keys())
@@ -1415,6 +1465,22 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     elif cfg.affiliated_group_entity_map:
         _c("blank", "")
         _c("sub", "Network matrix will appear here after re-running analysis with both entities in BigQuery.", "")
+
+    # ---- Pipeline status breakdown for missing enrollments ----
+    if missing_pipeline_reasons and acct["EXP_MISSING"] > 0:
+        _c("blank", "")
+        _c("section", "Missing enrollments — why the pipeline didn't enroll them")
+        _c("sub", "For each provider flagged as missing, this shows what the CertifyOS pipeline last did.", "")
+        _c("blank", "")
+        _c("colhdr", "Pipeline status", "Providers", "")
+        for _plabel, _pcount in missing_pipeline_reasons:
+            _pstyle = ("bad"  if "Pre-NPDB" in _plabel or "NPDB step failed" in _plabel else
+                       "warn" if "incomplete" in _plabel.lower() or "No pipeline" in _plabel else
+                       "good" if "Pipeline OK" in _plabel else "sub")
+            _c(_pstyle, _plabel, _pcount, "")
+        _c("sub",
+           "See the missing_enrollment tab for the full detail: which step failed and the plain-English reason.", "", "")
+
     client_layout = {"plast": len(client_summary) - 1}
 
     # ---- client_issues: per-issue detail page (clean provider tables, one section per issue) ----
