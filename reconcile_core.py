@@ -1192,7 +1192,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                     "npdb_enroll_status", "npdb_enroll_error"]
     if missing_rows:
         _missing_pids = [str(r[0]) for r in missing_rows]
-        _pipeline_info = _bq_pipeline_status(_missing_pids, _org_id, project)
+        _pipeline_info = _bq_pipeline_status(_missing_pids, _org_id,
+                                              (cfg.bq_project if cfg else None))
     _blank_pipeline = [""] * len(PIPELINE_HDR)
     enriched_missing = []
     for row in missing_rows:
