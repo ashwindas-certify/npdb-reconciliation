@@ -54,7 +54,7 @@ caqh AS (
   ) WHERE rn = 1
 )
 SELECT
-  e.providerId, e.firstName, e.lastName, e.middleName, e.dateOfBirth, e.npi,
+  e.providerId, e.organizationId, e.firstName, e.lastName, e.middleName, e.dateOfBirth, e.npi,
   e.credentialingStatus,
   IFNULL(e.credentialingCycle, 'Recredentialing') AS credentialingCycle,
   npdb.databank_subject_id,
@@ -160,6 +160,9 @@ class Result:
     extra_enrollments: int = 0    # NPDB enrollment records (persons) with no provider in the SOT
     client_workbook_id: str = ""  # separate client-facing spreadsheet (summary + recon), if created
     client_workbook_url: str = ""
+    # Pipeline-enriched missing enrollment data (populated when BQ pipeline_requests tables are reachable)
+    missing_pipeline_reasons: list = field(default_factory=list)   # [(reason_label, count), …] top-5 + Others
+    missing_enrollment_df: object = None                           # pandas DataFrame for CSV export
 
 # ----------------------------- auth -------------------------------
 def _creds(sa_key_path: str | None = None):
@@ -258,6 +261,152 @@ def bq_entity_map(project: str | None = None) -> dict:
         if name and entity:
             result.setdefault(name, []).append(entity)
     return result
+
+# -------- pipeline step status enrichment for missing enrollments --------
+# Steps in execution order (key, status_col, error_col).  The first 6 are
+# "pre-NPDB"; the last 2 are the NPDB-specific steps we care most about.
+_PIPELINE_STEPS = [
+    ("fetch_npi_status",     "fetch_npi_status_status",     "fetch_npi_status_error"),
+    ("fetch_nppes",          "fetch_nppes_status",          "fetch_nppes_error"),
+    ("process_nppes",        "process_nppes_status",        "process_nppes_error"),
+    ("fetch_proview_status", "fetch_proview_status_status", "fetch_proview_status_error"),
+    ("fetch_pdqs_status",    "fetch_pdqs_status_status",    "fetch_pdqs_status_error"),
+    ("process_caqh_data",    "process_caqh_data_status",    "process_caqh_data_error"),
+    ("fetch_npdb_request",   "fetch_npdb_request_status",   "fetch_npdb_request_error"),
+    ("fetch_npdb_enroll",    "fetch_npdb_enroll_status",    "fetch_npdb_enroll_error"),
+]
+_NPDB_STEPS = {"fetch_npdb_request", "fetch_npdb_enroll"}
+
+# Fetches the latest record per (provider_id, organization_id) from each step table,
+# filtered to the specific provider_ids + org_id we care about.
+_PIPELINE_CTE = """WITH pids AS (SELECT pid FROM UNNEST(@provider_ids) AS pid),
+fetch_nppes AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_fetch_nppes`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+fetch_npi_status AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_fetch_npi_status`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+fetch_pdqs_status AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_fetch_pdqs_status`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+fetch_proview_status AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_fetch_proview_status`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+process_caqh_data AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_process_caqh_data`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+process_nppes AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_process_nppes`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+fetch_npdb_request AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_fetch_npdb_request`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1),
+fetch_npdb_enroll AS (
+  SELECT * EXCEPT(rn) FROM (SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY provider_id,organization_id ORDER BY completed_at DESC) rn
+    FROM `certifyos-production-platform.appdb_data.provider_pipeline_requests_fetch_npdb_enroll`
+    WHERE organization_id=@org_id AND provider_id IN (SELECT pid FROM pids)) WHERE rn=1)
+SELECT p.pid AS provider_id,
+  npi.status AS fetch_npi_status_status,      JSON_VALUE(npi.error,'$.message')  AS fetch_npi_status_error,
+  nppes.status AS fetch_nppes_status,          JSON_VALUE(nppes.error,'$.message') AS fetch_nppes_error,
+  pnp.status   AS process_nppes_status,        JSON_VALUE(pnp.error,'$.message')   AS process_nppes_error,
+  pro.status   AS fetch_proview_status_status, JSON_VALUE(pro.error,'$.message')   AS fetch_proview_status_error,
+  pdqs.status  AS fetch_pdqs_status_status,    JSON_VALUE(pdqs.error,'$.message')  AS fetch_pdqs_status_error,
+  caqh.status  AS process_caqh_data_status,    JSON_VALUE(caqh.error,'$.message')  AS process_caqh_data_error,
+  req.status   AS fetch_npdb_request_status,   JSON_VALUE(req.error,'$.message')   AS fetch_npdb_request_error,
+  enr.status   AS fetch_npdb_enroll_status,    JSON_VALUE(enr.error,'$.message')   AS fetch_npdb_enroll_error
+FROM pids p
+LEFT JOIN fetch_npi_status npi   ON npi.provider_id  = p.pid
+LEFT JOIN fetch_nppes nppes      ON nppes.provider_id = p.pid
+LEFT JOIN process_nppes pnp      ON pnp.provider_id   = p.pid
+LEFT JOIN fetch_proview_status pro ON pro.provider_id = p.pid
+LEFT JOIN fetch_pdqs_status pdqs ON pdqs.provider_id  = p.pid
+LEFT JOIN process_caqh_data caqh ON caqh.provider_id  = p.pid
+LEFT JOIN fetch_npdb_request req ON req.provider_id   = p.pid
+LEFT JOIN fetch_npdb_enroll enr  ON enr.provider_id   = p.pid"""
+
+
+def _pipeline_row_summary(row: dict) -> dict:
+    """Derive human-readable summary + grouping label from one pipeline status row."""
+    sts = {k: (row.get(sc) or "").upper() for k, sc, ec in _PIPELINE_STEPS}
+    err = {k: (row.get(ec) or "")         for k, sc, ec in _PIPELINE_STEPS}
+
+    first_fail = next((k for k, _, _ in _PIPELINE_STEPS if sts[k] and sts[k] != "SUCCESS"), None)
+    missing    = [k for k, _, _ in _PIPELINE_STEPS if not sts[k]]
+    all_ok     = all(sts[k] == "SUCCESS" for k, _, _ in _PIPELINE_STEPS)
+    no_record  = not any(sts.values())
+
+    if no_record:
+        group   = "No pipeline run found"
+        detail  = group
+        pstatus = "NO_RECORD"
+    elif all_ok:
+        group   = "Pipeline OK — no active enrollment"
+        detail  = group
+        pstatus = "SUCCESS"
+    elif first_fail and first_fail not in _NPDB_STEPS:
+        group   = f"Pre-NPDB failure: {first_fail}"
+        reason  = err[first_fail] or sts[first_fail]
+        detail  = f"Pre-NPDB failure at {first_fail}: {reason}"
+        pstatus = "FAILED"
+    elif first_fail and first_fail in _NPDB_STEPS:
+        group   = f"NPDB step failed: {first_fail}"
+        reason  = err[first_fail] or sts[first_fail]
+        detail  = f"NPDB step failed ({first_fail}): {reason}"
+        pstatus = "FAILED"
+    elif missing and not first_fail:
+        label   = missing[0] if len(missing) == 1 else f"{len(missing)} steps"
+        group   = f"Pipeline incomplete: {label} never ran"
+        detail  = f"Pipeline incomplete — steps never ran: {', '.join(missing)}"
+        pstatus = "INCOMPLETE"
+    else:
+        group   = "Unknown pipeline state"
+        detail  = group
+        pstatus = "UNKNOWN"
+
+    pre_step   = first_fail if first_fail and first_fail not in _NPDB_STEPS else ""
+    pre_reason = (err.get(pre_step) or sts.get(pre_step, "")) if pre_step else ""
+
+    return {
+        "pipeline_status":          pstatus,
+        "pipeline_group":           group,   # short label for top-5 grouping
+        "pipeline_summary":         detail,  # full message for the sheet
+        "pre_npdb_failed_step":     pre_step,
+        "pre_npdb_failed_reason":   pre_reason,
+        "fetch_npdb_request_status": sts["fetch_npdb_request"],
+        "fetch_npdb_request_error":  err["fetch_npdb_request"],
+        "fetch_npdb_enroll_status":  sts["fetch_npdb_enroll"],
+        "fetch_npdb_enroll_error":   err["fetch_npdb_enroll"],
+    }
+
+
+def _bq_pipeline_status(provider_ids: list, org_id: str, project: str | None = None) -> dict:
+    """Return {provider_id: summary_dict} for the given providers in one BQ call."""
+    if not provider_ids or not org_id:
+        return {}
+    try:
+        rows = bq_rows(_PIPELINE_CTE, {"provider_ids": [str(p) for p in provider_ids],
+                                        "org_id": str(org_id)},
+                       project=project or DEFAULT_BQ_PROJECT)
+        return {str(r["provider_id"]): _pipeline_row_summary(r) for r in rows}
+    except Exception as exc:
+        print(f"  (pipeline status query skipped: {exc})", flush=True)
+        return {}
+
 
 def _retry(fn, what=""):
     for a in range(5):
@@ -1031,6 +1180,43 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     # LINK rows first (actionable now), then ADD rows; within each, most enrollments first
     extra_rows.sort(key=lambda r: (r[0] != "LINK_TO_PROVIDER", -r[17]))
 
+    # ---- enrich missing_rows with pipeline step status ----
+    # Extract org_id from the first provider that has it (added to SOT_SQL; absent in custom queries).
+    _org_id = next((str(p.get("organizationId", "")) for p in providers.values()
+                    if p.get("organizationId")), "")
+    _pipeline_info: dict = {}
+    _pipeline_groups: list = []   # one group label per missing provider (for top-5 aggregation)
+    PIPELINE_HDR = ["pipeline_status", "pipeline_summary",
+                    "pre_npdb_failed_step", "pre_npdb_failed_reason",
+                    "npdb_request_status", "npdb_request_error",
+                    "npdb_enroll_status", "npdb_enroll_error"]
+    if missing_rows:
+        _missing_pids = [str(r[0]) for r in missing_rows]
+        _pipeline_info = _bq_pipeline_status(_missing_pids, _org_id, project)
+    _blank_pipeline = [""] * len(PIPELINE_HDR)
+    enriched_missing = []
+    for row in missing_rows:
+        ps = _pipeline_info.get(str(row[0]), {})
+        _pipeline_groups.append(ps.get("pipeline_group", "No pipeline run found")
+                                 if ps else "No pipeline run found")
+        enriched_missing.append(row + [
+            ps.get("pipeline_status", ""),
+            ps.get("pipeline_summary", ""),
+            ps.get("pre_npdb_failed_step", ""),
+            ps.get("pre_npdb_failed_reason", ""),
+            ps.get("fetch_npdb_request_status", ""),
+            ps.get("fetch_npdb_request_error", ""),
+            ps.get("fetch_npdb_enroll_status", ""),
+            ps.get("fetch_npdb_enroll_error", ""),
+        ] if ps else _blank_pipeline)
+    missing_rows = enriched_missing
+
+    # Top-5 failure reasons for the UI (grouped label → count, then Others)
+    _reason_ctr = Counter(_pipeline_groups)
+    _top5 = _reason_ctr.most_common(5)
+    _others = sum(c for _, c in _reason_ctr.most_common()[5:])
+    missing_pipeline_reasons = _top5 + ([("Others", _others)] if _others else [])
+
     # ---- accounting summary ----
     miss_no_rec   = sum(1 for r in missing_rows if r[4] == "NO_NPDB_RECORD")
     miss_inactive = sum(1 for r in missing_rows if r[4] == "ENROLLMENT_NOT_ACTIVE")
@@ -1309,7 +1495,8 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "expectation","action_items","active_enrollments","cancelled_enrollments","npdb_statuses",
             "sot_databank_id","suggested_databank_id","match_tier","match_score","match_confidence","identity_conflict"] + NPDB_HDR,
         "missing_enrollment": ["providerId","provider_name","npi","credentialingStatus","missing_type",
-            "npdb_statuses","sot_databank_id","npdb_databank_ids","match_tier","match_score","match_confidence"] + NPDB_HDR,
+            "npdb_statuses","sot_databank_id","npdb_databank_ids","match_tier","match_score","match_confidence"]
+            + NPDB_HDR + PIPELINE_HDR,
         "network_missing_enrollment": [
             "providerId","provider_name","npi","credentialingStatus",
             "network_name","expected_entity","affiliated_groups",
@@ -1473,9 +1660,19 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             except Exception as e:
                 progress(f"⚠ Client workbook export failed: {str(e)[:200]}")
 
+    # Build export DataFrame for the missing_enrollment tab (used by Atlas download button)
+    _miss_hdrs = (["providerId","provider_name","npi","credentialingStatus","missing_type",
+                   "npdb_statuses","sot_databank_id","npdb_databank_ids","match_tier","match_score","match_confidence"]
+                  + NPDB_HDR + PIPELINE_HDR)
+    try:
+        _miss_df = pd.DataFrame(missing_rows, columns=_miss_hdrs) if missing_rows else pd.DataFrame(columns=_miss_hdrs)
+    except Exception:
+        _miss_df = None
+
     return Result(total=total, balanced=(tie == total), action_count=len(action_all),
                   summary=summary, counts=dict(counts), confidence=dict(confc), written_tabs=written,
-                  extra_enrollments=len(extra_groups), client_workbook_id=cw_id, client_workbook_url=cw_url)
+                  extra_enrollments=len(extra_groups), client_workbook_id=cw_id, client_workbook_url=cw_url,
+                  missing_pipeline_reasons=missing_pipeline_reasons, missing_enrollment_df=_miss_df)
 
 def _summary_format_reqs(sid, spec):
     """Google-Sheets batchUpdate requests that turn the raw `summary` tab into a banded,
