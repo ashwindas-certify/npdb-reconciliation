@@ -1109,10 +1109,11 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                 and delegation == "Non-Delegated"):
             ag = str(p.get("affiliated_groups", ""))
             for network_kw, expected_entity in cfg.affiliated_group_entity_map.items():
-                # If affiliated_groups data is present, only check networks the provider belongs to.
-                # If absent (empty), check ALL networks — Utah assumption: every credentialed
-                # Non-Delegated provider should be enrolled under each mapped network entity.
-                if ag and network_kw.lower() not in ag.lower():
+                # Only check networks the provider is explicitly affiliated with.
+                # affiliated_groups must contain the network keyword (case-insensitive).
+                # If the field is empty/absent, no network check is performed — network
+                # membership must be populated in the SOT for accurate gap analysis.
+                if network_kw.lower() not in ag.lower():
                     continue
                 entity_matches = [m for m in matched
                                   if m["entity"].strip().lower() == expected_entity.strip().lower()]
