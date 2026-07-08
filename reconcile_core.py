@@ -856,28 +856,57 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     NPDB3_HDR = ["npdb_name","npdb_npi","npdb_dob"]
 
     def _agg(recs, key):
-        """Comma-separated non-blank unique values for `key` across all records."""
+        """Comma-separated non-blank unique values for `key` across all records.
+        Only for IDENTITY fields (npi/dob/ssn4) that are expected constant per
+        person - order doesn't matter since there's normally just one value.
+        Do NOT use this for per-enrollment fields (entity/status/dates/names/
+        databank id); use _agg_aligned with _sorted_matched instead, or this
+        independently-sorted-per-field aggregation silently scrambles the
+        correspondence between columns (confirmed live 2026-07-08: an
+        alphabetically-sorted entity list next to an alphabetically-sorted
+        status list LOOKS paired but isn't - reading them positionally gave
+        the exact opposite of the truth for NPI 1265968317)."""
         return ", ".join(sorted({str(r[key]) for r in recs if r.get(key)}))
+
+    def _sorted_matched(recs):
+        """Matched records ordered once by enrollment start date, so every
+        per-enrollment field (databank id, entity, status, dates, canceller,
+        submitter) can be joined via _agg_aligned() in this SAME order and
+        stay positionally aligned with each other across columns."""
+        def _key(r):
+            ts = pd.to_datetime(r.get("enroll_start", ""), errors="coerce")
+            return ts if pd.notna(ts) else pd.Timestamp.max
+        return sorted(recs, key=_key)
+
+    def _agg_aligned(recs, key):
+        """Comma-separated values for `key`, one per record, in `recs`'
+        fixed order (from _sorted_matched) - NOT independently sorted or
+        deduped, so position i always refers to the same underlying
+        enrollment record in every column this is used for."""
+        return ", ".join(str(r.get(key) or "(none)") for r in recs)
 
     def npdb_pts(m, all_matched=None):
         """NPDB columns for one provider. `all_matched` aggregates multi-value fields
         (databank ids, statuses, entities, dates, canceller, submitter) across every
-        matched record so no cell is left blank when prim alone is empty."""
+        matched record so no cell is left blank when prim alone is empty. Per-enrollment
+        fields are ordered once (oldest enrollment first) via _sorted_matched so position i
+        means the same record in every column, not independently sorted per field."""
         if not m: return [""] * len(NPDB_HDR)
         recs = all_matched or [m]
+        aligned = _sorted_matched(recs)
         name = f"{m['raw_last']}, {m['raw_first']}".strip(", ")
         return [
             name,
             _agg(recs, "npi")          or m["npi"],
             _agg(recs, "dob")          or m["dob"],
             _agg(recs, "ssn4")         or m["ssn4"],
-            _agg(recs, "databank_id")  or m["databank_id"],
-            _agg(recs, "enroll_status") or m["enroll_status"],
-            _agg(recs, "entity")       or m["entity"],
-            _agg(recs, "enroll_start") or m["enroll_start"],
-            _agg(recs, "cancel_date")  or m["cancel_date"],
-            _agg(recs, "cancelled_by") or m["cancelled_by"],
-            _agg(recs, "enrolled_by")  or m["enrolled_by"],
+            _agg_aligned(aligned, "databank_id")  or m["databank_id"],
+            _agg_aligned(aligned, "enroll_status") or m["enroll_status"],
+            _agg_aligned(aligned, "entity")       or m["entity"],
+            _agg_aligned(aligned, "enroll_start") or m["enroll_start"],
+            _agg_aligned(aligned, "cancel_date")  or m["cancel_date"],
+            _agg_aligned(aligned, "cancelled_by") or m["cancelled_by"],
+            _agg_aligned(aligned, "enrolled_by")  or m["enrolled_by"],
         ]
     def npdb3(m):
         return [f"{m['raw_last']}, {m['raw_first']}".strip(", "), m["npi"], m["dob"]] if m else ["","",""]
@@ -1007,11 +1036,16 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                              statuses or "(none)", n_enr, outcome, action_txt, ", ".join(npdb_ids)])
         # client_summary breakdowns + client_issues tables (`delegation`/`npdb_label` set above).
         # Expected = Active, Non-Delegated (credentialed/recredentialing, not delegated) -> should be enrolled.
-        ids_str = ", ".join(npdb_ids); entity_str = _agg(matched, "entity") if matched else ""
-        p_start    = _agg(matched, "enroll_start") if matched else ""
-        p_cancel   = _agg(matched, "cancel_date")  if matched else ""
-        p_cancelby = _agg(matched, "cancelled_by") if matched else ""
-        p_enrolledby = _agg(matched, "enrolled_by") if matched else ""
+        # All per-record fields below come from the SAME _sorted_matched() order
+        # so position i (e.g. the 2nd databank id) is the same enrollment as
+        # the 2nd entity, 2nd start date, etc. - not independently sorted.
+        _aligned = _sorted_matched(matched) if matched else []
+        ids_str      = _agg_aligned(_aligned, "databank_id") if matched else ""
+        entity_str   = _agg_aligned(_aligned, "entity")      if matched else ""
+        p_start      = _agg_aligned(_aligned, "enroll_start") if matched else ""
+        p_cancel     = _agg_aligned(_aligned, "cancel_date")  if matched else ""
+        p_cancelby   = _agg_aligned(_aligned, "cancelled_by") if matched else ""
+        p_enrolledby = _agg_aligned(_aligned, "enrolled_by")  if matched else ""
         if delegation == "Non-Delegated" and expect == "expects_active":
             xtab_exp[(cs.strip() or "(blank)", npdb_label)] += 1
             if n_enr == 0:
@@ -1193,14 +1227,18 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         disp = "LINK_TO_PROVIDER" if link else "ADD_TO_SOT"
         if link: n_extra_link += 1
         else:    n_extra_new += 1
-        db_ids      = sorted({x["databank_id"] for x in ms if x["databank_id"]})
-        active_dbs  = sorted({x["databank_id"] for x in ms if x["enroll_class"] == "active" and x["databank_id"]})
+        active_dbs = sorted({x["databank_id"] for x in ms if x["enroll_class"] == "active" and x["databank_id"]})
         licenses = sorted({x["raw_license"] for x in ms if x["raw_license"]})
         states   = sorted({x["state"] for x in ms if x["state"]})
-        statuses = "; ".join(sorted({x["enroll_status"] for x in ms if x["enroll_status"]}))
-        starts   = "; ".join(sorted({x["enroll_start"] for x in ms if x["enroll_start"]}))
-        cancels  = "; ".join(sorted({x["cancel_date"] for x in ms if x["cancel_date"]}))
-        cancelby = "; ".join(sorted({x["cancelled_by"] for x in ms if x["cancelled_by"]}))
+        # db_ids/statuses/starts/cancels/cancelby are per-enrollment fields, so they're
+        # all built from the SAME _sorted_matched() order - position i is the same
+        # record in every one of these, not independently sorted per field.
+        _aligned_ms = _sorted_matched(ms)
+        db_ids   = [str(r.get("databank_id") or "(none)") for r in _aligned_ms]
+        statuses = "; ".join(str(r.get("enroll_status") or "(none)") for r in _aligned_ms)
+        starts   = "; ".join(str(r.get("enroll_start") or "(none)") for r in _aligned_ms)
+        cancels  = "; ".join(str(r.get("cancel_date") or "(none)") for r in _aligned_ms)
+        cancelby = "; ".join(str(r.get("cancelled_by") or "(none)") for r in _aligned_ms)
         name     = f"{rep['raw_last']}, {rep['raw_first']}".strip(", ")
         extra_rows.append([
             disp, (pid if link else ""), (rconf if pid else "NONE"), (rbasis if pid else ""), rscore,
