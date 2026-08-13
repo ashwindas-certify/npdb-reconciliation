@@ -9,7 +9,7 @@ Auth: a service account. Provide the key via Config.sa_key_path OR env GOOGLE_SA
 (path) OR GOOGLE_SA_KEY_JSON (inline JSON, e.g. a Cloud Run secret).
 """
 from __future__ import annotations
-import os, re, json, time
+import os, re, json, time, random
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 import pandas as pd
@@ -441,12 +441,47 @@ def _bq_pipeline_status(provider_ids: list, org_id: str, project: str | None = N
         return {}
 
 
-def _retry(fn, what=""):
-    for a in range(5):
-        try: return fn()
+_RETRY_STATUS = {429, 500, 502, 503, 504}   # rate limit + transient server errors
+
+
+def _http_status(e):
+    """HTTP status from a googleapiclient HttpError, else None."""
+    r = getattr(e, "resp", None)
+    s = getattr(r, "status", None)
+    try:
+        return int(s) if s is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry(fn, what="", attempts=6):
+    """Retry a Sheets/Drive call with backoff that can actually outlast a quota window.
+
+    The old version slept 2,4,6,8s — 20 seconds across all attempts. Google's
+    Sheets limits are per 60 SECONDS, so every retry landed inside the same
+    quota minute and failed identically; a rate-limited write could never
+    recover (CalMHSA - San Joaquin failed three runs in a row this way).
+    Backoff is now exponential with jitter and spans well past 60s.
+
+    It also used to retry EVERY exception five times, so a permanent 403 burned
+    ~20s of sleeps per call on something that could never succeed. Only rate
+    limits and transient 5xx are retried now; anything else raises immediately.
+    """
+    delay = 5.0
+    for a in range(attempts):
+        try:
+            return fn()
         except Exception as e:
-            if a == 4: raise
-            time.sleep(2*(a+1))
+            status = _http_status(e)
+            last = (a == attempts - 1)
+            if status is not None and status not in _RETRY_STATUS:
+                raise                       # 400/403/404 etc — retrying cannot help
+            if last:
+                raise
+            # 5, 10, 20, 40, 80s (+jitter) — total ~155s, comfortably past the
+            # 60s quota window even if the first failure lands at its start.
+            time.sleep(delay + random.uniform(0, delay * 0.25))
+            delay *= 2
 
 def list_tabs(svc, sheet_id):
     meta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id).execute(), "meta")
