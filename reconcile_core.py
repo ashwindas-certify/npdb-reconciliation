@@ -132,6 +132,21 @@ class Config:
     #   delegated   — Delegated providers still actively enrolled
     #   duplicates  — providers with more than one active enrollment
     client_issue_types: set  = field(default_factory=lambda: {"missing","terminated","delegated","duplicates"})
+    # ---- Sheets write strategy ----
+    # True  : group the writes — one spreadsheets.batchUpdate for every add/delete,
+    #         one for every resize, N values.batchUpdate for the payloads, one for
+    #         all formatting. ~50 sequential calls per client becomes ~5.
+    # False : the original one-call-per-step-per-tab path, kept as a rollback that
+    #         needs no code change (set cfg.batched_writes = False).
+    batched_writes: bool     = True
+    # Cells per values.batchUpdate request. Sheets caps request size, so payloads
+    # are grouped up to this budget and then flushed.
+    write_cells_per_request: int = 400_000
+    # The original path issued values.clear() before every write. It is redundant
+    # once the grid is resized to exactly the data size — the resize itself drops
+    # out-of-range cells and the write then covers every remaining cell. Set True
+    # to restore the belt-and-braces clear.
+    clear_before_write: bool = False
     max_rows_per_tab: int    = 100000      # split a result tab into <name>_2, _3… past this many rows (0 = never)
     cell_budget: int         = 9_000_000   # stay under Sheets' 10M-cells-per-spreadsheet cap; biggest
                                            # tabs are trimmed (with a readme note) rather than erroring
@@ -163,6 +178,35 @@ class Result:
     # Pipeline-enriched missing enrollment data (populated when BQ pipeline_requests tables are reachable)
     missing_pipeline_reasons: list = field(default_factory=list)   # [(reason_label, count), …] top-5 + Others
     missing_enrollment_df: object = None                           # pandas DataFrame for CSV export
+    # {tab_name: {"header": [...], "rows": [[...], ...]}} — every result tab, in memory.
+    #
+    # Exists so a caller never has to read back what it just wrote. The BigQuery
+    # audit ingest used to call read_action_tabs() immediately after reconcile()
+    # and re-download 7 tabs from Sheets — including `reconciliation`, one row per
+    # provider (163,585 rows for Oscar) — to build rows that were already sitting
+    # in this function's locals. Use tab_dicts() to get the same shape
+    # read_action_tabs() returns.
+    tab_data: dict = field(default_factory=dict)
+
+    def tab_dicts(self, names=None) -> dict:
+        """{tab_name: [row_dict, ...]} — same contract as read_action_tabs().
+
+        Note this is the UNTRIMMED data: when a run exceeds Sheets' 10M-cell
+        spreadsheet cap the written tabs are trimmed, but the rows here are
+        complete, so the BigQuery record is complete even when the sheet is not.
+        """
+        out = {}
+        for name, blob in (self.tab_data or {}).items():
+            if names is not None and name not in names:
+                continue
+            hdr = [str(h).strip() for h in (blob.get("header") or [])]
+            rows = blob.get("rows") or []
+            if not hdr:
+                out[name] = []          # spec-driven tab (summary/client_*) — not row data
+                continue
+            out[name] = [{hdr[i]: (r[i] if i < len(r) else "") for i in range(len(hdr))}
+                         for r in rows]
+        return out
 
 # ----------------------------- auth -------------------------------
 def _creds(sa_key_path: str | None = None):
@@ -204,6 +248,29 @@ def _bq_client(project: str | None = None):
     return _bq_clients[key]
 
 
+# How bq_rows() materialises a result set:
+#   "arrow" — RowIterator.to_arrow(), which uses the BigQuery Storage API when
+#             google-cloud-bigquery-storage is installed. Several times faster on
+#             large results because rows arrive as columnar batches over gRPC
+#             instead of one JSON page at a time over REST.
+#   "rows"  — the original per-Row iteration.
+#   "auto"  — arrow when pyarrow is importable, else rows.
+# Override with NPDB_BQ_FETCH=rows to rule the fetch path out while debugging.
+BQ_FETCH_MODE = os.environ.get("NPDB_BQ_FETCH", "auto").strip().lower()
+
+
+def _arrow_available() -> bool:
+    if BQ_FETCH_MODE == "rows":
+        return False
+    if BQ_FETCH_MODE == "arrow":
+        return True
+    try:
+        import pyarrow  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def bq_rows(sql: str, params: dict | None = None, project: str | None = None, progress=None):
     """Run a parameterized query and return rows as list[dict] — same shape as read_tab(),
     so the rest of reconcile() is source-agnostic. `params` -> @name STRING params,
@@ -221,9 +288,29 @@ def bq_rows(sql: str, params: dict | None = None, project: str | None = None, pr
             else:
                 bq_params.append(bigquery.ScalarQueryParameter(k, "STRING", v))
         job_cfg = bigquery.QueryJobConfig(query_parameters=bq_params)
+    job = client.query(sql, job_config=job_cfg)
+
+    # Columnar fetch first. Falls back to the row path on ANY failure — a missing
+    # grpc extra, a blocked Storage API endpoint, an unsupported column type — so
+    # this can never be the reason a run fails, only the reason it is quick.
+    if _arrow_available():
+        try:
+            it = job.result()
+            tbl = it.to_arrow(create_bqstorage_client=True)
+            # NULL -> "" so BigQuery rows behave like (empty) sheet cells for the
+            # normalizers, exactly as the row path below does.
+            out = [{k: ("" if v is None else v) for k, v in rec.items()}
+                   for rec in tbl.to_pylist()]
+            if progress and len(out) >= 50000:
+                progress(f"fetched {len(out):,} rows from BigQuery (columnar)…")
+            return out
+        except Exception as e:
+            if progress:
+                progress(f"columnar fetch unavailable ({str(e)[:80]}) — using row fetch")
+
     # NULL -> "" so BigQuery rows behave like (empty) sheet cells for the normalizers
     out = []
-    for r in client.query(sql, job_config=job_cfg).result(page_size=50000):
+    for r in job.result(page_size=50000):
         out.append({k: ("" if v is None else v) for k, v in r.items()})
         if progress and len(out) % 50000 == 0:
             progress(f"fetched {len(out):,} rows from BigQuery…")
@@ -1666,6 +1753,13 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "should_be_cancelled": cancel_rows, "duplicates": dups, "databank_updates": db_updates,
             "extra_enrollments": extra_rows, "reconciliation": out}
 
+    # Snapshot the tabs for the caller BEFORE the write block, which may rebind
+    # data[n] to a trimmed slice for the 10M-cell cap. Rebinding leaves these
+    # references pointing at the full lists, which is what we want: the sheet can
+    # be trimmed, the BigQuery record should not be.
+    tab_data = {name: {"header": list(headers.get(name) or []), "rows": rows}
+                for name, rows in data.items()}
+
     written = []
     cw_id = cw_url = ""
     if write:
@@ -1673,6 +1767,10 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         meta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id).execute(), "meta")
         existing = {s["properties"]["title"] for s in meta["sheets"]}
         sheet_ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
+        # Existing embedded charts, harvested here so the formatting step below does
+        # not need its own spreadsheets.get just to learn the chart ids to delete.
+        old_charts_by_title = {s["properties"]["title"]: [c["chartId"] for c in s.get("charts", [])]
+                               for s in meta["sheets"] if s.get("charts")}
         order = ["readme","summary","client_summary","client_issues","action_items_all","missing_enrollment",
                  "network_missing_enrollment","should_be_cancelled","duplicates","databank_updates",
                  "extra_enrollments","reconciliation"]
@@ -1736,57 +1834,59 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                 "remove stale split tabs")
             existing -= set(del_split)
 
-        for title, hdr, chunk in plan:
-            body = ([hdr] + chunk) if hdr else chunk
-            width = max((len(r) for r in body), default=1)
-            if title not in existing:
-                resp = _retry(lambda t=title: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                    body={"requests":[{"addSheet":{"properties":{"title":t}}}]}).execute(), f"add {title}")
-                sheet_ids[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-                existing.add(title)
-            # exact-size the grid: reclaims cells left by bigger past runs and guarantees
-            # the chunked writes below always land inside the grid
-            _retry(lambda t=title, r=max(len(body), 2), c=max(width, 1):
-                svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [
-                    {"updateSheetProperties": {"properties": {"sheetId": sheet_ids[t],
-                        "gridProperties": {"rowCount": r, "columnCount": c}},
-                     "fields": "gridProperties(rowCount,columnCount)"}}]}).execute(), f"size {title}")
-            _retry(lambda t=title: svc.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"'{t}'").execute(), f"clear {title}")
-            # write in row batches — one giant update times out on big tabs
-            WRITE_CHUNK = 20000
-            for start in range(0, len(body), WRITE_CHUNK):
-                _retry(lambda t=title, p=body[start:start+WRITE_CHUNK], s=start:
-                    svc.spreadsheets().values().update(spreadsheetId=sheet_id,
-                        range=f"'{t}'!A{s+1}", valueInputOption="RAW",
-                        body={"values": p}).execute(), f"write {title}")
-                if len(body) > WRITE_CHUNK:
-                    progress(f"{title}: wrote {min(start+WRITE_CHUNK, len(body)):,}/{len(body):,} rows…")
-            written.append(title)
+        if cfg.batched_writes:
+            written = _write_tabs_batched(svc, sheet_id, plan, sheet_ids, existing,
+                                          cfg, progress)
+        else:
+            # Original one-call-per-step-per-tab path. Kept verbatim so
+            # cfg.batched_writes = False is a real rollback, not a rewrite.
+            for title, hdr, chunk in plan:
+                body = ([hdr] + chunk) if hdr else chunk
+                width = max((len(r) for r in body), default=1)
+                if title not in existing:
+                    resp = _retry(lambda t=title: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
+                        body={"requests":[{"addSheet":{"properties":{"title":t}}}]}).execute(), f"add {title}")
+                    sheet_ids[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+                    existing.add(title)
+                # exact-size the grid: reclaims cells left by bigger past runs and guarantees
+                # the chunked writes below always land inside the grid
+                _retry(lambda t=title, r=max(len(body), 2), c=max(width, 1):
+                    svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [
+                        {"updateSheetProperties": {"properties": {"sheetId": sheet_ids[t],
+                            "gridProperties": {"rowCount": r, "columnCount": c}},
+                         "fields": "gridProperties(rowCount,columnCount)"}}]}).execute(), f"size {title}")
+                _retry(lambda t=title: svc.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"'{t}'").execute(), f"clear {title}")
+                # write in row batches — one giant update times out on big tabs
+                WRITE_CHUNK = 20000
+                for start in range(0, len(body), WRITE_CHUNK):
+                    _retry(lambda t=title, p=body[start:start+WRITE_CHUNK], s=start:
+                        svc.spreadsheets().values().update(spreadsheetId=sheet_id,
+                            range=f"'{t}'!A{s+1}", valueInputOption="RAW",
+                            body={"values": p}).execute(), f"write {title}")
+                    if len(body) > WRITE_CHUNK:
+                        progress(f"{title}: wrote {min(start+WRITE_CHUNK, len(body)):,}/{len(body):,} rows…")
+                written.append(title)
 
-        # color-code & band the summary tab (values are already written above)
+        # ---- formatting: all three tabs in ONE batchUpdate ----
+        # Was three separate batchUpdates plus a second spreadsheets.get purely to
+        # find the existing chart ids. The chart ids are already in `meta` (the
+        # default get returns sheets[].charts), so that extra round-trip is gone.
+        progress("Formatting summary tabs…")
+        fmt_reqs = []
         if "summary" in sheet_ids:
-            progress("Formatting summary tab…")
-            _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                body={"requests": _summary_format_reqs(sheet_ids["summary"], SUMMARY_SPEC)}).execute(),
-                "format summary")
-
-        # format the client summary and embed its charts (delete prior charts first so re-runs don't stack them)
+            fmt_reqs += _summary_format_reqs(sheet_ids["summary"], SUMMARY_SPEC)
         if "client_summary" in sheet_ids:
-            progress("Formatting client summary tab…")
-            cmeta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id,
-                fields="sheets(properties(sheetId,title),charts(chartId))").execute(), "client charts meta")
-            old_charts = next(([c["chartId"] for c in s.get("charts", [])]
-                               for s in cmeta.get("sheets", [])
-                               if s["properties"]["title"] == "client_summary"), [])
-            reqs = [{"deleteEmbeddedObject": {"objectId": cid}} for cid in old_charts]
-            reqs += _client_summary_reqs(sheet_ids["client_summary"], client_spec, client_summary, client_layout)
-            _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                body={"requests": reqs}).execute(), "format client summary")
+            # delete prior charts first, or re-runs stack a new copy on every run
+            fmt_reqs += [{"deleteEmbeddedObject": {"objectId": cid}}
+                         for cid in old_charts_by_title.get("client_summary", [])]
+            fmt_reqs += _client_summary_reqs(sheet_ids["client_summary"], client_spec,
+                                              client_summary, client_layout)
         if "client_issues" in sheet_ids:
-            progress("Formatting client issues tab…")
+            fmt_reqs += _client_summary_reqs(sheet_ids["client_issues"], issues_spec,
+                                             client_issues, issues_layout)
+        if fmt_reqs:
             _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                body={"requests": _client_summary_reqs(sheet_ids["client_issues"], issues_spec, client_issues, issues_layout)}).execute(),
-                "format client issues")
+                body={"requests": fmt_reqs}).execute(), "format tabs")
 
         # separate, clean client-facing spreadsheet (summary + issues + recon), shared anyone-with-link
         if client_workbook:
@@ -1811,7 +1911,95 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     return Result(total=total, balanced=(tie == total), action_count=len(action_all),
                   summary=summary, counts=dict(counts), confidence=dict(confc), written_tabs=written,
                   extra_enrollments=len(extra_groups), client_workbook_id=cw_id, client_workbook_url=cw_url,
-                  missing_pipeline_reasons=missing_pipeline_reasons, missing_enrollment_df=_miss_df)
+                  missing_pipeline_reasons=missing_pipeline_reasons, missing_enrollment_df=_miss_df,
+                  tab_data=tab_data)
+
+def _write_tabs_batched(svc, sheet_id, plan, sheet_ids, existing, cfg, progress):
+    """Write every planned tab using grouped API calls.
+
+    The original path spent 4 sequential requests per tab — addSheet, resize,
+    values.clear, values.update — so a 12-tab run cost ~48 round-trips before any
+    formatting. Sheets' write quota is per MINUTE PER USER, so that count, not the
+    data volume, was the ceiling: it is why run_batch_analysis was pinned to 2
+    workers after 4 tripped HTTP 429.
+
+    This does the same work in: 1 batchUpdate for every add, 1 for every resize,
+    and as few values.batchUpdate calls as the cell budget allows. Genuinely large
+    tabs are still split by rows (one giant request times out), but small tabs now
+    travel together instead of claiming a request each.
+
+    Returns the list of titles written, in plan order.
+    """
+    bodies = []                                    # (title, rows_incl_header, width)
+    for title, hdr, chunk in plan:
+        body = ([hdr] + chunk) if hdr else chunk
+        bodies.append((title, body, max((len(r) for r in body), default=1)))
+
+    # 1 ── create every missing tab in ONE request, mapping replies back by order
+    to_add = [t for t, _, _ in bodies if t not in existing]
+    if to_add:
+        resp = _retry(lambda: svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": t}}} for t in to_add]}
+        ).execute(), f"add {len(to_add)} tab(s)")
+        for t, reply in zip(to_add, resp.get("replies", [])):
+            sheet_ids[t] = reply["addSheet"]["properties"]["sheetId"]
+            existing.add(t)
+
+    # 2 ── exact-size every grid in ONE request. Same reasoning as before: this
+    #      reclaims cells left behind by a bigger past run and guarantees the
+    #      writes below land inside the grid.
+    size_reqs = [{"updateSheetProperties": {
+                     "properties": {"sheetId": sheet_ids[t],
+                                    "gridProperties": {"rowCount": max(len(b), 2),
+                                                       "columnCount": max(w, 1)}},
+                     "fields": "gridProperties(rowCount,columnCount)"}}
+                 for t, b, w in bodies if t in sheet_ids]
+    if size_reqs:
+        _retry(lambda: svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": size_reqs}).execute(),
+            f"size {len(size_reqs)} tab(s)")
+
+    # Redundant once the grid is exactly the data size, so off by default — but
+    # one batchClear if you want it back, not one clear per tab.
+    if cfg.clear_before_write:
+        _retry(lambda: svc.spreadsheets().values().batchClear(
+            spreadsheetId=sheet_id,
+            body={"ranges": [f"'{t}'" for t, _, _ in bodies]}).execute(),
+            f"clear {len(bodies)} tab(s)")
+
+    # 3 ── payloads, packed up to the cell budget
+    budget = max(int(cfg.write_cells_per_request or 0), 10_000)
+    pending, pending_cells = [], 0
+
+    def flush():
+        nonlocal pending, pending_cells
+        if not pending:
+            return
+        d = list(pending)
+        _retry(lambda: svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": d}).execute(),
+            f"write {len(d)} range(s)")
+        pending, pending_cells = [], 0
+
+    for title, body, width in bodies:
+        rows_per_req = max(1, budget // max(width, 1))
+        for start in range(0, len(body), rows_per_req):
+            part = body[start:start + rows_per_req]
+            cells = len(part) * max(width, 1)
+            if pending and pending_cells + cells > budget:
+                flush()
+            pending.append({"range": f"'{title}'!A{start + 1}", "values": part})
+            pending_cells += cells
+            if len(body) > rows_per_req:
+                progress(f"{title}: queued {min(start + rows_per_req, len(body)):,}"
+                         f"/{len(body):,} rows…")
+        if pending_cells >= budget:
+            flush()
+    flush()
+    return [t for t, _, _ in bodies]
+
 
 def _summary_format_reqs(sid, spec):
     """Google-Sheets batchUpdate requests that turn the raw `summary` tab into a banded,
