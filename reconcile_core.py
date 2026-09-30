@@ -57,7 +57,24 @@ SELECT
   e.providerId, e.organizationId, e.firstName, e.lastName, e.middleName, e.dateOfBirth, e.npi,
   e.credentialingStatus,
   IFNULL(e.credentialingCycle, 'Recredentialing') AS credentialingCycle,
-  npdb.databank_subject_id,
+  -- The SOT databank id lives in TWO places and they disagree.
+  --
+  -- `PATCH /providers/{id}` (the databank fix) writes
+  -- edit_providers.npdbProviderInfo_databankSubjectID. The side table
+  -- edit_providers_npdb_data is NOT updated by it. Reading only the side table
+  -- meant every fix was invisible here, so the provider was re-flagged
+  -- DATABANK_ID_OUT_OF_SYNC on the next run, forever.
+  --
+  -- Measured 2026-09-02 over 8,690 providers with a successful, non-dry PATCH:
+  --   8,686 (99.95%) had the value on npdbProviderInfo_databankSubjectID
+  --   8,299 (95.5%)  were absent/different in the side table  (baseline ~2%)
+  -- and the id this query returned was unchanged run-over-run 99.5-100% of the
+  -- time across every client, with ~0 rows ever adopting the suggestion.
+  --
+  -- Prefer the column the write actually targets; keep the side table as the
+  -- fallback for providers whose id only ever came from the pipeline.
+  COALESCE(NULLIF(e.npdbProviderInfo_databankSubjectID, ''),
+           npdb.databank_subject_id) AS databank_subject_id,
   sl.state_licenses,
   JSON_VALUE(caqh.practitioner_information, '$.gender') AS gender,
   JSON_VALUE(caqh.practitioner_information, '$.ssn') AS ssn,
@@ -150,6 +167,13 @@ class Config:
     max_rows_per_tab: int    = 100000      # split a result tab into <name>_2, _3… past this many rows (0 = never)
     cell_budget: int         = 9_000_000   # stay under Sheets' 10M-cells-per-spreadsheet cap; biggest
                                            # tabs are trimmed (with a readme note) rather than erroring
+    # Collect one record per MATCHED NPDB ENROLLMENT (not per provider) on the Result
+    # as `enrollment_detail`. Off by default so no existing caller changes behaviour.
+    # The per-enrollment fields are already joined into the reconciliation row by
+    # _agg_aligned, but that output cannot be split back apart safely — entity names
+    # contain commas ("ALMA COMMUNITY NETWORK, LLC"), which is exactly the separator.
+    # A caller that wants enrollments as rows needs them handed over as objects.
+    collect_enrollment_detail: bool = False
     sa_key_path: str | None  = None        # falls back to env
     # --- BigQuery SOT source (auth = your local ADC; no service account) ---
     bq_project: str | None     = None      # GCP project to bill/run the query in
@@ -178,6 +202,9 @@ class Result:
     # Pipeline-enriched missing enrollment data (populated when BQ pipeline_requests tables are reachable)
     missing_pipeline_reasons: list = field(default_factory=list)   # [(reason_label, count), …] top-5 + Others
     missing_enrollment_df: object = None                           # pandas DataFrame for CSV export
+    # One dict per matched NPDB enrollment, when cfg.collect_enrollment_detail is set.
+    # Empty otherwise. See Config.collect_enrollment_detail.
+    enrollment_detail: list = field(default_factory=list)
     # {tab_name: {"header": [...], "rows": [[...], ...]}} — every result tab, in memory.
     #
     # Exists so a caller never has to read back what it just wrote. The BigQuery
@@ -209,13 +236,39 @@ class Result:
         return out
 
 # ----------------------------- auth -------------------------------
+# Where the Sheets service-account key may live. It used to be a single
+# hardcoded ~/Downloads path; when the workspace moved to ~/certifyos every
+# client in a 33-client batch failed with a bare "No such file or directory"
+# and the batch reported 0 ok / 33 failed with no hint that ONE missing file was
+# the cause. Search, in order, and say what was tried when none is found.
+_SA_KEY_NAME = "create-494211-147f2005e4ac.json"
+
+
+def _sa_key_candidates(sa_key_path: str | None = None):
+    home = os.path.expanduser("~")
+    out = [sa_key_path, os.environ.get("GOOGLE_SA_KEY")]
+    out += [os.path.join(home, "certifyos", "secrets", _SA_KEY_NAME),
+            os.path.join(home, "certifyos", _SA_KEY_NAME),
+            os.path.join(home, "Downloads", _SA_KEY_NAME)]
+    seen, uniq = set(), []
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
 def _creds(sa_key_path: str | None = None):
     inline = os.environ.get("GOOGLE_SA_KEY_JSON")
     if inline:
         return service_account.Credentials.from_service_account_info(json.loads(inline), scopes=SCOPES)
-    path = sa_key_path or os.environ.get("GOOGLE_SA_KEY") or \
-           os.path.join(os.path.expanduser("~"), "Downloads", "create-494211-147f2005e4ac.json")
-    return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+    tried = _sa_key_candidates(sa_key_path)
+    for path in tried:
+        if os.path.exists(path):
+            return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+    raise FileNotFoundError(
+        "Google service-account key not found. Set GOOGLE_SA_KEY (or "
+        "GOOGLE_SA_KEY_JSON with the key inline). Looked in: " + "; ".join(tried))
 
 def _authed_http(creds):
     # large reads/writes (100K-row tabs) outlive the default 60s socket timeout
@@ -945,6 +998,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
+    enrollment_detail = []      # one dict per matched enrollment (cfg.collect_enrollment_detail)
     network_missing_rows = []   # per-network enrollment gaps (populated when affiliated_group_entity_map is set)
     network_ok_counts    = Counter()   # network_kw → providers correctly enrolled under that entity
     # (cs, coverage) → count  where coverage = "UUHP", "HCU", "Both", "None", etc.
@@ -1146,6 +1200,57 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         npi = npi_n(p.get("npi")); cs = str(p.get("credentialingStatus",""))
         cyc_raw = str(p.get("credentialingCycle",""))
         statuses = "; ".join(sorted({m["enroll_status"] for m in matched}))
+
+        if cfg.collect_enrollment_detail:
+            # One row per enrollment, oldest first — the same order and the same
+            # deduped record set the aligned columns above are built from, so the two
+            # views can never disagree.
+            for seq, m in enumerate(_sorted_matched(matched), start=1):
+                enrollment_detail.append({
+                    "providerId": pid, "provider_name": pname, "npi": npi,
+                    "enrollment_seq": seq, "total_npdb_enrollments": len(matched),
+                    "npdb_databank_id": m["databank_id"],
+                    "npdb_enroll_status": m["enroll_status"],
+                    "is_active": "Y" if m["enroll_class"] == "active" else "N",
+                    "enroll_class": m["enroll_class"],
+                    "npdb_entity": m["entity"],
+                    "enroll_start_date": m["enroll_start"],
+                    "cancel_date": m["cancel_date"],
+                    "cancelled_by": m["cancelled_by"],
+                    "enrolled_by": m["enrolled_by"],
+                    "npdb_name": f"{m['raw_last']}, {m['raw_first']}".strip(", "),
+                    "npdb_npi": m["npi"], "npdb_dob": m["dob"],
+                    "npdb_ssn_last4": m["ssn4"], "npdb_license": m["raw_license"],
+                    "active_enrollments": n_enr, "cancelled_enrollments": n_can,
+                    "other_enrollments": n_oth,
+                    "duplicate_active": "Y" if _is_dup else "N",
+                    "suggested_databank_id": suggested_db,
+                    "sot_databank_id": sot_db,
+                    "databank_in_sync": ("Y" if (sot_db and sot_db in npdb_ids)
+                                         else ("N" if matched else "")),
+                    "credentialingStatus": cs, "expectation": expect,
+                    "match_tier": tier, "match_score": score, "match_confidence": conf,
+                    "flags": " | ".join(flags),
+                })
+            if not matched:
+                # A provider with NO enrollment still needs a line, or "everyone in my
+                # file" silently becomes "everyone who was found".
+                enrollment_detail.append({
+                    "providerId": pid, "provider_name": pname, "npi": npi,
+                    "enrollment_seq": 0, "total_npdb_enrollments": 0,
+                    "npdb_databank_id": "", "npdb_enroll_status": "(not enrolled)",
+                    "is_active": "N", "enroll_class": "", "npdb_entity": "",
+                    "enroll_start_date": "", "cancel_date": "", "cancelled_by": "",
+                    "enrolled_by": "", "npdb_name": "", "npdb_npi": "", "npdb_dob": "",
+                    "npdb_ssn_last4": "", "npdb_license": "",
+                    "active_enrollments": 0, "cancelled_enrollments": 0,
+                    "other_enrollments": 0, "duplicate_active": "N",
+                    "suggested_databank_id": "", "sot_databank_id": sot_db,
+                    "databank_in_sync": "",
+                    "credentialingStatus": cs, "expectation": expect,
+                    "match_tier": tier, "match_score": score, "match_confidence": conf,
+                    "flags": " | ".join(flags),
+                })
         out.append([pid, pname, npi, cs, cyc_raw, cls, expect, tier, score, conf, conflict, len(matched),
                     n_enr, n_can, n_oth, statuses, sot_db, ", ".join(npdb_ids),
                     ("Y" if (sot_db and sot_db in npdb_ids) else ("N" if matched else "")),
@@ -1912,6 +2017,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                   summary=summary, counts=dict(counts), confidence=dict(confc), written_tabs=written,
                   extra_enrollments=len(extra_groups), client_workbook_id=cw_id, client_workbook_url=cw_url,
                   missing_pipeline_reasons=missing_pipeline_reasons, missing_enrollment_df=_miss_df,
+                  enrollment_detail=enrollment_detail,
                   tab_data=tab_data)
 
 def _write_tabs_batched(svc, sheet_id, plan, sheet_ids, existing, cfg, progress):
