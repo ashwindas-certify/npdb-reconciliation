@@ -4,6 +4,8 @@ Reconciles a client's credentialing status (SOT) against NPDB enrollment status,
 issues, validates databank ids, and writes result tabs back to the client's Google Sheet.
 Web UI (Streamlit) + reusable core + CLI.
 
+> **Most people should use the NPDB Command Center** (github.com/ashwindas-certify/npdb_command_center), which imports `reconcile_core` from this repo and is the supported UI. The Streamlit `app.py` here is the original standalone tool.
+
 ## Files
 | File | What |
 |---|---|
