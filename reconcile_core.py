@@ -57,7 +57,24 @@ SELECT
   e.providerId, e.organizationId, e.firstName, e.lastName, e.middleName, e.dateOfBirth, e.npi,
   e.credentialingStatus,
   IFNULL(e.credentialingCycle, 'Recredentialing') AS credentialingCycle,
-  npdb.databank_subject_id,
+  -- The SOT databank id lives in TWO places and they disagree.
+  --
+  -- `PATCH /providers/{id}` (the databank fix) writes
+  -- edit_providers.npdbProviderInfo_databankSubjectID. The side table
+  -- edit_providers_npdb_data is NOT updated by it. Reading only the side table
+  -- meant every fix was invisible here, so the provider was re-flagged
+  -- DATABANK_ID_OUT_OF_SYNC on the next run, forever.
+  --
+  -- Measured 2026-09-02 over 8,690 providers with a successful, non-dry PATCH:
+  --   8,686 (99.95%) had the value on npdbProviderInfo_databankSubjectID
+  --   8,299 (95.5%)  were absent/different in the side table  (baseline ~2%)
+  -- and the id this query returned was unchanged run-over-run 99.5-100% of the
+  -- time across every client, with ~0 rows ever adopting the suggestion.
+  --
+  -- Prefer the column the write actually targets; keep the side table as the
+  -- fallback for providers whose id only ever came from the pipeline.
+  COALESCE(NULLIF(e.npdbProviderInfo_databankSubjectID, ''),
+           npdb.databank_subject_id) AS databank_subject_id,
   sl.state_licenses,
   JSON_VALUE(caqh.practitioner_information, '$.gender') AS gender,
   JSON_VALUE(caqh.practitioner_information, '$.ssn') AS ssn,
@@ -132,9 +149,31 @@ class Config:
     #   delegated   — Delegated providers still actively enrolled
     #   duplicates  — providers with more than one active enrollment
     client_issue_types: set  = field(default_factory=lambda: {"missing","terminated","delegated","duplicates"})
+    # ---- Sheets write strategy ----
+    # True  : group the writes — one spreadsheets.batchUpdate for every add/delete,
+    #         one for every resize, N values.batchUpdate for the payloads, one for
+    #         all formatting. ~50 sequential calls per client becomes ~5.
+    # False : the original one-call-per-step-per-tab path, kept as a rollback that
+    #         needs no code change (set cfg.batched_writes = False).
+    batched_writes: bool     = True
+    # Cells per values.batchUpdate request. Sheets caps request size, so payloads
+    # are grouped up to this budget and then flushed.
+    write_cells_per_request: int = 400_000
+    # The original path issued values.clear() before every write. It is redundant
+    # once the grid is resized to exactly the data size — the resize itself drops
+    # out-of-range cells and the write then covers every remaining cell. Set True
+    # to restore the belt-and-braces clear.
+    clear_before_write: bool = False
     max_rows_per_tab: int    = 100000      # split a result tab into <name>_2, _3… past this many rows (0 = never)
     cell_budget: int         = 9_000_000   # stay under Sheets' 10M-cells-per-spreadsheet cap; biggest
                                            # tabs are trimmed (with a readme note) rather than erroring
+    # Collect one record per MATCHED NPDB ENROLLMENT (not per provider) on the Result
+    # as `enrollment_detail`. Off by default so no existing caller changes behaviour.
+    # The per-enrollment fields are already joined into the reconciliation row by
+    # _agg_aligned, but that output cannot be split back apart safely — entity names
+    # contain commas ("ALMA COMMUNITY NETWORK, LLC"), which is exactly the separator.
+    # A caller that wants enrollments as rows needs them handed over as objects.
+    collect_enrollment_detail: bool = False
     sa_key_path: str | None  = None        # falls back to env
     # --- BigQuery SOT source (auth = your local ADC; no service account) ---
     bq_project: str | None     = None      # GCP project to bill/run the query in
@@ -163,15 +202,73 @@ class Result:
     # Pipeline-enriched missing enrollment data (populated when BQ pipeline_requests tables are reachable)
     missing_pipeline_reasons: list = field(default_factory=list)   # [(reason_label, count), …] top-5 + Others
     missing_enrollment_df: object = None                           # pandas DataFrame for CSV export
+    # One dict per matched NPDB enrollment, when cfg.collect_enrollment_detail is set.
+    # Empty otherwise. See Config.collect_enrollment_detail.
+    enrollment_detail: list = field(default_factory=list)
+    # {tab_name: {"header": [...], "rows": [[...], ...]}} — every result tab, in memory.
+    #
+    # Exists so a caller never has to read back what it just wrote. The BigQuery
+    # audit ingest used to call read_action_tabs() immediately after reconcile()
+    # and re-download 7 tabs from Sheets — including `reconciliation`, one row per
+    # provider (163,585 rows for Oscar) — to build rows that were already sitting
+    # in this function's locals. Use tab_dicts() to get the same shape
+    # read_action_tabs() returns.
+    tab_data: dict = field(default_factory=dict)
+
+    def tab_dicts(self, names=None) -> dict:
+        """{tab_name: [row_dict, ...]} — same contract as read_action_tabs().
+
+        Note this is the UNTRIMMED data: when a run exceeds Sheets' 10M-cell
+        spreadsheet cap the written tabs are trimmed, but the rows here are
+        complete, so the BigQuery record is complete even when the sheet is not.
+        """
+        out = {}
+        for name, blob in (self.tab_data or {}).items():
+            if names is not None and name not in names:
+                continue
+            hdr = [str(h).strip() for h in (blob.get("header") or [])]
+            rows = blob.get("rows") or []
+            if not hdr:
+                out[name] = []          # spec-driven tab (summary/client_*) — not row data
+                continue
+            out[name] = [{hdr[i]: (r[i] if i < len(r) else "") for i in range(len(hdr))}
+                         for r in rows]
+        return out
 
 # ----------------------------- auth -------------------------------
+# Where the Sheets service-account key may live. It used to be a single
+# hardcoded ~/Downloads path; when the workspace moved to ~/certifyos every
+# client in a 33-client batch failed with a bare "No such file or directory"
+# and the batch reported 0 ok / 33 failed with no hint that ONE missing file was
+# the cause. Search, in order, and say what was tried when none is found.
+_SA_KEY_NAME = "create-494211-147f2005e4ac.json"
+
+
+def _sa_key_candidates(sa_key_path: str | None = None):
+    home = os.path.expanduser("~")
+    out = [sa_key_path, os.environ.get("GOOGLE_SA_KEY")]
+    out += [os.path.join(home, "certifyos", "secrets", _SA_KEY_NAME),
+            os.path.join(home, "certifyos", _SA_KEY_NAME),
+            os.path.join(home, "Downloads", _SA_KEY_NAME)]
+    seen, uniq = set(), []
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            uniq.append(p)
+    return uniq
+
+
 def _creds(sa_key_path: str | None = None):
     inline = os.environ.get("GOOGLE_SA_KEY_JSON")
     if inline:
         return service_account.Credentials.from_service_account_info(json.loads(inline), scopes=SCOPES)
-    path = sa_key_path or os.environ.get("GOOGLE_SA_KEY") or \
-           os.path.join(os.path.expanduser("~"), "Downloads", "create-494211-147f2005e4ac.json")
-    return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+    tried = _sa_key_candidates(sa_key_path)
+    for path in tried:
+        if os.path.exists(path):
+            return service_account.Credentials.from_service_account_file(path, scopes=SCOPES)
+    raise FileNotFoundError(
+        "Google service-account key not found. Set GOOGLE_SA_KEY (or "
+        "GOOGLE_SA_KEY_JSON with the key inline). Looked in: " + "; ".join(tried))
 
 def _authed_http(creds):
     # large reads/writes (100K-row tabs) outlive the default 60s socket timeout
@@ -204,6 +301,29 @@ def _bq_client(project: str | None = None):
     return _bq_clients[key]
 
 
+# How bq_rows() materialises a result set:
+#   "arrow" — RowIterator.to_arrow(), which uses the BigQuery Storage API when
+#             google-cloud-bigquery-storage is installed. Several times faster on
+#             large results because rows arrive as columnar batches over gRPC
+#             instead of one JSON page at a time over REST.
+#   "rows"  — the original per-Row iteration.
+#   "auto"  — arrow when pyarrow is importable, else rows.
+# Override with NPDB_BQ_FETCH=rows to rule the fetch path out while debugging.
+BQ_FETCH_MODE = os.environ.get("NPDB_BQ_FETCH", "auto").strip().lower()
+
+
+def _arrow_available() -> bool:
+    if BQ_FETCH_MODE == "rows":
+        return False
+    if BQ_FETCH_MODE == "arrow":
+        return True
+    try:
+        import pyarrow  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def bq_rows(sql: str, params: dict | None = None, project: str | None = None, progress=None):
     """Run a parameterized query and return rows as list[dict] — same shape as read_tab(),
     so the rest of reconcile() is source-agnostic. `params` -> @name STRING params,
@@ -221,9 +341,29 @@ def bq_rows(sql: str, params: dict | None = None, project: str | None = None, pr
             else:
                 bq_params.append(bigquery.ScalarQueryParameter(k, "STRING", v))
         job_cfg = bigquery.QueryJobConfig(query_parameters=bq_params)
+    job = client.query(sql, job_config=job_cfg)
+
+    # Columnar fetch first. Falls back to the row path on ANY failure — a missing
+    # grpc extra, a blocked Storage API endpoint, an unsupported column type — so
+    # this can never be the reason a run fails, only the reason it is quick.
+    if _arrow_available():
+        try:
+            it = job.result()
+            tbl = it.to_arrow(create_bqstorage_client=True)
+            # NULL -> "" so BigQuery rows behave like (empty) sheet cells for the
+            # normalizers, exactly as the row path below does.
+            out = [{k: ("" if v is None else v) for k, v in rec.items()}
+                   for rec in tbl.to_pylist()]
+            if progress and len(out) >= 50000:
+                progress(f"fetched {len(out):,} rows from BigQuery (columnar)…")
+            return out
+        except Exception as e:
+            if progress:
+                progress(f"columnar fetch unavailable ({str(e)[:80]}) — using row fetch")
+
     # NULL -> "" so BigQuery rows behave like (empty) sheet cells for the normalizers
     out = []
-    for r in client.query(sql, job_config=job_cfg).result(page_size=50000):
+    for r in job.result(page_size=50000):
         out.append({k: ("" if v is None else v) for k, v in r.items()})
         if progress and len(out) % 50000 == 0:
             progress(f"fetched {len(out):,} rows from BigQuery…")
@@ -858,6 +998,7 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         return idxs, "+".join(bb), round(bs, 1), conf, conflict
 
     out, dups, db_updates, missing_rows, cancel_rows, action_all = [], [], [], [], [], []
+    enrollment_detail = []      # one dict per matched enrollment (cfg.collect_enrollment_detail)
     network_missing_rows = []   # per-network enrollment gaps (populated when affiliated_group_entity_map is set)
     network_ok_counts    = Counter()   # network_kw → providers correctly enrolled under that entity
     # (cs, coverage) → count  where coverage = "UUHP", "HCU", "Both", "None", etc.
@@ -1059,6 +1200,57 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         npi = npi_n(p.get("npi")); cs = str(p.get("credentialingStatus",""))
         cyc_raw = str(p.get("credentialingCycle",""))
         statuses = "; ".join(sorted({m["enroll_status"] for m in matched}))
+
+        if cfg.collect_enrollment_detail:
+            # One row per enrollment, oldest first — the same order and the same
+            # deduped record set the aligned columns above are built from, so the two
+            # views can never disagree.
+            for seq, m in enumerate(_sorted_matched(matched), start=1):
+                enrollment_detail.append({
+                    "providerId": pid, "provider_name": pname, "npi": npi,
+                    "enrollment_seq": seq, "total_npdb_enrollments": len(matched),
+                    "npdb_databank_id": m["databank_id"],
+                    "npdb_enroll_status": m["enroll_status"],
+                    "is_active": "Y" if m["enroll_class"] == "active" else "N",
+                    "enroll_class": m["enroll_class"],
+                    "npdb_entity": m["entity"],
+                    "enroll_start_date": m["enroll_start"],
+                    "cancel_date": m["cancel_date"],
+                    "cancelled_by": m["cancelled_by"],
+                    "enrolled_by": m["enrolled_by"],
+                    "npdb_name": f"{m['raw_last']}, {m['raw_first']}".strip(", "),
+                    "npdb_npi": m["npi"], "npdb_dob": m["dob"],
+                    "npdb_ssn_last4": m["ssn4"], "npdb_license": m["raw_license"],
+                    "active_enrollments": n_enr, "cancelled_enrollments": n_can,
+                    "other_enrollments": n_oth,
+                    "duplicate_active": "Y" if _is_dup else "N",
+                    "suggested_databank_id": suggested_db,
+                    "sot_databank_id": sot_db,
+                    "databank_in_sync": ("Y" if (sot_db and sot_db in npdb_ids)
+                                         else ("N" if matched else "")),
+                    "credentialingStatus": cs, "expectation": expect,
+                    "match_tier": tier, "match_score": score, "match_confidence": conf,
+                    "flags": " | ".join(flags),
+                })
+            if not matched:
+                # A provider with NO enrollment still needs a line, or "everyone in my
+                # file" silently becomes "everyone who was found".
+                enrollment_detail.append({
+                    "providerId": pid, "provider_name": pname, "npi": npi,
+                    "enrollment_seq": 0, "total_npdb_enrollments": 0,
+                    "npdb_databank_id": "", "npdb_enroll_status": "(not enrolled)",
+                    "is_active": "N", "enroll_class": "", "npdb_entity": "",
+                    "enroll_start_date": "", "cancel_date": "", "cancelled_by": "",
+                    "enrolled_by": "", "npdb_name": "", "npdb_npi": "", "npdb_dob": "",
+                    "npdb_ssn_last4": "", "npdb_license": "",
+                    "active_enrollments": 0, "cancelled_enrollments": 0,
+                    "other_enrollments": 0, "duplicate_active": "N",
+                    "suggested_databank_id": "", "sot_databank_id": sot_db,
+                    "databank_in_sync": "",
+                    "credentialingStatus": cs, "expectation": expect,
+                    "match_tier": tier, "match_score": score, "match_confidence": conf,
+                    "flags": " | ".join(flags),
+                })
         out.append([pid, pname, npi, cs, cyc_raw, cls, expect, tier, score, conf, conflict, len(matched),
                     n_enr, n_can, n_oth, statuses, sot_db, ", ".join(npdb_ids),
                     ("Y" if (sot_db and sot_db in npdb_ids) else ("N" if matched else "")),
@@ -1666,6 +1858,13 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
             "should_be_cancelled": cancel_rows, "duplicates": dups, "databank_updates": db_updates,
             "extra_enrollments": extra_rows, "reconciliation": out}
 
+    # Snapshot the tabs for the caller BEFORE the write block, which may rebind
+    # data[n] to a trimmed slice for the 10M-cell cap. Rebinding leaves these
+    # references pointing at the full lists, which is what we want: the sheet can
+    # be trimmed, the BigQuery record should not be.
+    tab_data = {name: {"header": list(headers.get(name) or []), "rows": rows}
+                for name, rows in data.items()}
+
     written = []
     cw_id = cw_url = ""
     if write:
@@ -1673,6 +1872,10 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
         meta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id).execute(), "meta")
         existing = {s["properties"]["title"] for s in meta["sheets"]}
         sheet_ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta["sheets"]}
+        # Existing embedded charts, harvested here so the formatting step below does
+        # not need its own spreadsheets.get just to learn the chart ids to delete.
+        old_charts_by_title = {s["properties"]["title"]: [c["chartId"] for c in s.get("charts", [])]
+                               for s in meta["sheets"] if s.get("charts")}
         order = ["readme","summary","client_summary","client_issues","action_items_all","missing_enrollment",
                  "network_missing_enrollment","should_be_cancelled","duplicates","databank_updates",
                  "extra_enrollments","reconciliation"]
@@ -1736,57 +1939,59 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
                 "remove stale split tabs")
             existing -= set(del_split)
 
-        for title, hdr, chunk in plan:
-            body = ([hdr] + chunk) if hdr else chunk
-            width = max((len(r) for r in body), default=1)
-            if title not in existing:
-                resp = _retry(lambda t=title: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                    body={"requests":[{"addSheet":{"properties":{"title":t}}}]}).execute(), f"add {title}")
-                sheet_ids[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
-                existing.add(title)
-            # exact-size the grid: reclaims cells left by bigger past runs and guarantees
-            # the chunked writes below always land inside the grid
-            _retry(lambda t=title, r=max(len(body), 2), c=max(width, 1):
-                svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [
-                    {"updateSheetProperties": {"properties": {"sheetId": sheet_ids[t],
-                        "gridProperties": {"rowCount": r, "columnCount": c}},
-                     "fields": "gridProperties(rowCount,columnCount)"}}]}).execute(), f"size {title}")
-            _retry(lambda t=title: svc.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"'{t}'").execute(), f"clear {title}")
-            # write in row batches — one giant update times out on big tabs
-            WRITE_CHUNK = 20000
-            for start in range(0, len(body), WRITE_CHUNK):
-                _retry(lambda t=title, p=body[start:start+WRITE_CHUNK], s=start:
-                    svc.spreadsheets().values().update(spreadsheetId=sheet_id,
-                        range=f"'{t}'!A{s+1}", valueInputOption="RAW",
-                        body={"values": p}).execute(), f"write {title}")
-                if len(body) > WRITE_CHUNK:
-                    progress(f"{title}: wrote {min(start+WRITE_CHUNK, len(body)):,}/{len(body):,} rows…")
-            written.append(title)
+        if cfg.batched_writes:
+            written = _write_tabs_batched(svc, sheet_id, plan, sheet_ids, existing,
+                                          cfg, progress)
+        else:
+            # Original one-call-per-step-per-tab path. Kept verbatim so
+            # cfg.batched_writes = False is a real rollback, not a rewrite.
+            for title, hdr, chunk in plan:
+                body = ([hdr] + chunk) if hdr else chunk
+                width = max((len(r) for r in body), default=1)
+                if title not in existing:
+                    resp = _retry(lambda t=title: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
+                        body={"requests":[{"addSheet":{"properties":{"title":t}}}]}).execute(), f"add {title}")
+                    sheet_ids[title] = resp["replies"][0]["addSheet"]["properties"]["sheetId"]
+                    existing.add(title)
+                # exact-size the grid: reclaims cells left by bigger past runs and guarantees
+                # the chunked writes below always land inside the grid
+                _retry(lambda t=title, r=max(len(body), 2), c=max(width, 1):
+                    svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id, body={"requests": [
+                        {"updateSheetProperties": {"properties": {"sheetId": sheet_ids[t],
+                            "gridProperties": {"rowCount": r, "columnCount": c}},
+                         "fields": "gridProperties(rowCount,columnCount)"}}]}).execute(), f"size {title}")
+                _retry(lambda t=title: svc.spreadsheets().values().clear(spreadsheetId=sheet_id, range=f"'{t}'").execute(), f"clear {title}")
+                # write in row batches — one giant update times out on big tabs
+                WRITE_CHUNK = 20000
+                for start in range(0, len(body), WRITE_CHUNK):
+                    _retry(lambda t=title, p=body[start:start+WRITE_CHUNK], s=start:
+                        svc.spreadsheets().values().update(spreadsheetId=sheet_id,
+                            range=f"'{t}'!A{s+1}", valueInputOption="RAW",
+                            body={"values": p}).execute(), f"write {title}")
+                    if len(body) > WRITE_CHUNK:
+                        progress(f"{title}: wrote {min(start+WRITE_CHUNK, len(body)):,}/{len(body):,} rows…")
+                written.append(title)
 
-        # color-code & band the summary tab (values are already written above)
+        # ---- formatting: all three tabs in ONE batchUpdate ----
+        # Was three separate batchUpdates plus a second spreadsheets.get purely to
+        # find the existing chart ids. The chart ids are already in `meta` (the
+        # default get returns sheets[].charts), so that extra round-trip is gone.
+        progress("Formatting summary tabs…")
+        fmt_reqs = []
         if "summary" in sheet_ids:
-            progress("Formatting summary tab…")
-            _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                body={"requests": _summary_format_reqs(sheet_ids["summary"], SUMMARY_SPEC)}).execute(),
-                "format summary")
-
-        # format the client summary and embed its charts (delete prior charts first so re-runs don't stack them)
+            fmt_reqs += _summary_format_reqs(sheet_ids["summary"], SUMMARY_SPEC)
         if "client_summary" in sheet_ids:
-            progress("Formatting client summary tab…")
-            cmeta = _retry(lambda: svc.spreadsheets().get(spreadsheetId=sheet_id,
-                fields="sheets(properties(sheetId,title),charts(chartId))").execute(), "client charts meta")
-            old_charts = next(([c["chartId"] for c in s.get("charts", [])]
-                               for s in cmeta.get("sheets", [])
-                               if s["properties"]["title"] == "client_summary"), [])
-            reqs = [{"deleteEmbeddedObject": {"objectId": cid}} for cid in old_charts]
-            reqs += _client_summary_reqs(sheet_ids["client_summary"], client_spec, client_summary, client_layout)
-            _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                body={"requests": reqs}).execute(), "format client summary")
+            # delete prior charts first, or re-runs stack a new copy on every run
+            fmt_reqs += [{"deleteEmbeddedObject": {"objectId": cid}}
+                         for cid in old_charts_by_title.get("client_summary", [])]
+            fmt_reqs += _client_summary_reqs(sheet_ids["client_summary"], client_spec,
+                                              client_summary, client_layout)
         if "client_issues" in sheet_ids:
-            progress("Formatting client issues tab…")
+            fmt_reqs += _client_summary_reqs(sheet_ids["client_issues"], issues_spec,
+                                             client_issues, issues_layout)
+        if fmt_reqs:
             _retry(lambda: svc.spreadsheets().batchUpdate(spreadsheetId=sheet_id,
-                body={"requests": _client_summary_reqs(sheet_ids["client_issues"], issues_spec, client_issues, issues_layout)}).execute(),
-                "format client issues")
+                body={"requests": fmt_reqs}).execute(), "format tabs")
 
         # separate, clean client-facing spreadsheet (summary + issues + recon), shared anyone-with-link
         if client_workbook:
@@ -1811,7 +2016,96 @@ def reconcile(sheet_id: str, sot_tab: str | None, npdb_tab: str | None, cfg: Con
     return Result(total=total, balanced=(tie == total), action_count=len(action_all),
                   summary=summary, counts=dict(counts), confidence=dict(confc), written_tabs=written,
                   extra_enrollments=len(extra_groups), client_workbook_id=cw_id, client_workbook_url=cw_url,
-                  missing_pipeline_reasons=missing_pipeline_reasons, missing_enrollment_df=_miss_df)
+                  missing_pipeline_reasons=missing_pipeline_reasons, missing_enrollment_df=_miss_df,
+                  enrollment_detail=enrollment_detail,
+                  tab_data=tab_data)
+
+def _write_tabs_batched(svc, sheet_id, plan, sheet_ids, existing, cfg, progress):
+    """Write every planned tab using grouped API calls.
+
+    The original path spent 4 sequential requests per tab — addSheet, resize,
+    values.clear, values.update — so a 12-tab run cost ~48 round-trips before any
+    formatting. Sheets' write quota is per MINUTE PER USER, so that count, not the
+    data volume, was the ceiling: it is why run_batch_analysis was pinned to 2
+    workers after 4 tripped HTTP 429.
+
+    This does the same work in: 1 batchUpdate for every add, 1 for every resize,
+    and as few values.batchUpdate calls as the cell budget allows. Genuinely large
+    tabs are still split by rows (one giant request times out), but small tabs now
+    travel together instead of claiming a request each.
+
+    Returns the list of titles written, in plan order.
+    """
+    bodies = []                                    # (title, rows_incl_header, width)
+    for title, hdr, chunk in plan:
+        body = ([hdr] + chunk) if hdr else chunk
+        bodies.append((title, body, max((len(r) for r in body), default=1)))
+
+    # 1 ── create every missing tab in ONE request, mapping replies back by order
+    to_add = [t for t, _, _ in bodies if t not in existing]
+    if to_add:
+        resp = _retry(lambda: svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": t}}} for t in to_add]}
+        ).execute(), f"add {len(to_add)} tab(s)")
+        for t, reply in zip(to_add, resp.get("replies", [])):
+            sheet_ids[t] = reply["addSheet"]["properties"]["sheetId"]
+            existing.add(t)
+
+    # 2 ── exact-size every grid in ONE request. Same reasoning as before: this
+    #      reclaims cells left behind by a bigger past run and guarantees the
+    #      writes below land inside the grid.
+    size_reqs = [{"updateSheetProperties": {
+                     "properties": {"sheetId": sheet_ids[t],
+                                    "gridProperties": {"rowCount": max(len(b), 2),
+                                                       "columnCount": max(w, 1)}},
+                     "fields": "gridProperties(rowCount,columnCount)"}}
+                 for t, b, w in bodies if t in sheet_ids]
+    if size_reqs:
+        _retry(lambda: svc.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id, body={"requests": size_reqs}).execute(),
+            f"size {len(size_reqs)} tab(s)")
+
+    # Redundant once the grid is exactly the data size, so off by default — but
+    # one batchClear if you want it back, not one clear per tab.
+    if cfg.clear_before_write:
+        _retry(lambda: svc.spreadsheets().values().batchClear(
+            spreadsheetId=sheet_id,
+            body={"ranges": [f"'{t}'" for t, _, _ in bodies]}).execute(),
+            f"clear {len(bodies)} tab(s)")
+
+    # 3 ── payloads, packed up to the cell budget
+    budget = max(int(cfg.write_cells_per_request or 0), 10_000)
+    pending, pending_cells = [], 0
+
+    def flush():
+        nonlocal pending, pending_cells
+        if not pending:
+            return
+        d = list(pending)
+        _retry(lambda: svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": d}).execute(),
+            f"write {len(d)} range(s)")
+        pending, pending_cells = [], 0
+
+    for title, body, width in bodies:
+        rows_per_req = max(1, budget // max(width, 1))
+        for start in range(0, len(body), rows_per_req):
+            part = body[start:start + rows_per_req]
+            cells = len(part) * max(width, 1)
+            if pending and pending_cells + cells > budget:
+                flush()
+            pending.append({"range": f"'{title}'!A{start + 1}", "values": part})
+            pending_cells += cells
+            if len(body) > rows_per_req:
+                progress(f"{title}: queued {min(start + rows_per_req, len(body)):,}"
+                         f"/{len(body):,} rows…")
+        if pending_cells >= budget:
+            flush()
+    flush()
+    return [t for t, _, _ in bodies]
+
 
 def _summary_format_reqs(sid, spec):
     """Google-Sheets batchUpdate requests that turn the raw `summary` tab into a banded,
